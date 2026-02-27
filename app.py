@@ -131,12 +131,46 @@ def _friendly_decision_reason(reason: str) -> str:
 
 
 def _filter_by_period(installs: pd.DataFrame, period_days: int | None) -> pd.DataFrame:
+    """period_days 기반 필터 — 내부 호환용으로 유지."""
     if period_days is None:
         return installs
     inst = installs.copy()
     inst["_d"] = pd.to_datetime(inst["install_time"]).dt.normalize()
     cutoff = inst["_d"].max() - pd.Timedelta(days=period_days - 1)
     return inst[inst["_d"] >= cutoff].drop(columns=["_d"])
+
+
+def _filter_by_daterange(installs: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
+    """날짜 범위(date 객체) 기반 필터."""
+    inst = installs.copy()
+    inst["_d"] = pd.to_datetime(inst["install_time"]).dt.normalize()
+    cutoff_s = pd.Timestamp(start_date)
+    cutoff_e = pd.Timestamp(end_date)
+    return inst[(inst["_d"] >= cutoff_s) & (inst["_d"] <= cutoff_e)].drop(columns=["_d"])
+
+
+def _date_slider(installs: pd.DataFrame, key: str):
+    """
+    데이터 기간 내에서 날짜 범위 슬라이더를 표시하고 (start, end) date 반환.
+    데이터가 없으면 None, None 반환.
+    """
+    if installs.empty:
+        return None, None
+    dates = pd.to_datetime(installs["install_time"]).dt.normalize()
+    min_d = dates.min().date()
+    max_d = dates.max().date()
+    if min_d == max_d:
+        st.caption(f"📅 분석 기간: {min_d} (단일 날짜)")
+        return min_d, max_d
+    result = st.slider(
+        "📅 분석 기간",
+        min_value=min_d,
+        max_value=max_d,
+        value=(min_d, max_d),
+        format="YYYY-MM-DD",
+        key=key,
+    )
+    return result[0], result[1]
 
 
 def _style_decision_table(df: pd.DataFrame):
@@ -414,12 +448,10 @@ with tab_decision:
 | **효율 상태** | 성과를 4단계로 요약 (효율 우수 / 목표 근접 / 효율 저하 / 표본 부족) |
 """)
 
-        p1, p2, p3, p4 = st.columns(4)
+        p1, p2, p3 = st.columns(3)
         decision_level = p1.selectbox("분석 레벨", ANALYSIS_LEVEL_OPTIONS, index=1, format_func=lambda x: ANALYSIS_LEVEL_LABELS[x], key="decision_level")
         target_roas    = p2.number_input("목표 ROAS", min_value=0.0, value=1.0, step=0.05, key="decision_target_roas")
         min_installs   = p3.number_input("최소 설치수 기준", min_value=1, value=200, step=10, key="decision_min_installs")
-        period_label   = p4.selectbox("분석 기간", ["최근 7일", "최근 14일", "최근 30일", "전체 기간"], index=2, key="decision_period")
-        period_days    = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30, "전체 기간": None}[period_label]
 
         # Geo 필터
         all_geos = sorted(canonical.installs["geo"].dropna().unique().tolist()) if "geo" in canonical.installs.columns else []
@@ -429,7 +461,8 @@ with tab_decision:
         else:
             filtered_installs = canonical.installs
 
-        period_installs = _filter_by_period(filtered_installs, period_days)
+        d_start, d_end  = _date_slider(filtered_installs, key="decision_daterange")
+        period_installs = _filter_by_daterange(filtered_installs, d_start, d_end) if d_start else filtered_installs
         if period_installs.empty:
             st.warning("선택한 기간에 데이터가 없습니다. 기간을 넓혀 주세요.")
         else:
@@ -515,12 +548,10 @@ with tab_budget:
 - 예산을 대폭 늘리면 오디언스 소진으로 실제 ROAS가 예상보다 낮아질 수 있습니다.
 """)
 
-        b1, b2, b3 = st.columns(3)
-        total_budget       = b1.number_input("다음 달 총 예산 (원)", min_value=100_000, value=50_000_000, step=1_000_000, format="%d", key="budget_total")
-        budget_period_label= b2.selectbox("성과 참고 기간", ["최근 7일", "최근 14일", "최근 30일"], index=2, key="budget_period")
-        budget_period_days = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30}[budget_period_label]
-        exclude_sd         = b3.checkbox("감액 판단 매체 배분 제외", value=True, key="budget_exclude_sd",
-                                          help="UA 판단에서 감액 판정된 매체는 배분에서 제외합니다")
+        b1, b2 = st.columns(2)
+        total_budget = b1.number_input("다음 달 총 예산 (원)", min_value=100_000, value=50_000_000, step=1_000_000, format="%d", key="budget_total")
+        exclude_sd   = b2.checkbox("감액 판단 매체 배분 제외", value=True, key="budget_exclude_sd",
+                                    help="UA 판단에서 감액 판정된 매체는 배분에서 제외합니다")
 
         # Geo 필터
         all_geos_b = sorted(canonical.installs["geo"].dropna().unique().tolist()) if "geo" in canonical.installs.columns else []
@@ -530,7 +561,9 @@ with tab_budget:
         else:
             budget_installs = canonical.installs
 
-        period_installs_b = _filter_by_period(budget_installs, budget_period_days)
+        b_start, b_end    = _date_slider(budget_installs, key="budget_daterange")
+        period_installs_b = _filter_by_daterange(budget_installs, b_start, b_end) if b_start else budget_installs
+        budget_period_days = (pd.Timestamp(b_end) - pd.Timestamp(b_start)).days + 1 if b_start else 30
 
         # 감액 판단 참조용
         budget_metrics  = calculate_media_metrics(period_installs_b, canonical.events, canonical.cost, level="media_source")
@@ -589,12 +622,9 @@ with tab_curve:
     else:
         st.caption("D일 누적 LTV = 설치 후 D일 이내 누적 매출 ÷ 설치수")
 
-        cu1, cu2 = st.columns([1, 1])
-        curve_level        = cu1.selectbox("분석 레벨", ANALYSIS_LEVEL_OPTIONS, index=0, format_func=lambda x: ANALYSIS_LEVEL_LABELS[x], key="curve_level")
-        curve_period_label = cu2.selectbox("기간", ["최근 7일", "최근 14일", "최근 30일", "전체"], index=2, key="curve_period")
-        curve_period_days  = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30, "전체": None}[curve_period_label]
-
-        curve_installs = _filter_by_period(canonical.installs, curve_period_days)
+        curve_level = st.selectbox("분석 레벨", ANALYSIS_LEVEL_OPTIONS, index=0, format_func=lambda x: ANALYSIS_LEVEL_LABELS[x], key="curve_level")
+        c_start, c_end = _date_slider(canonical.installs, key="curve_daterange")
+        curve_installs = _filter_by_daterange(canonical.installs, c_start, c_end) if c_start else canonical.installs
         curve          = calculate_cohort_curve(curve_installs, canonical.events, max_day=30, level=curve_level)
 
         if curve.empty:
