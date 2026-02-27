@@ -48,13 +48,15 @@ EFFICIENCY_NOTE_MAP = {
     "Efficiency risk":   "🔴 효율 저하",
     "Near target":       "🟡 목표 근접",
 }
+# (seed, label, phase)
+# phase: "launch" = 사전예약~런칭기 (7~10억/월), "sustain" = 유지기 (1.5~3억/월)
 DUMMY_SCENARIO_OPTIONS = [
-    (11, "시나리오 1 · 안정형 밸런스"),
-    (27, "시나리오 2 · 고효율 매체 강세"),
-    (42, "시나리오 3 · 기본 추천 시나리오"),
-    (58, "시나리오 4 · 저효율/보수 운영"),
-    (73, "시나리오 5 · 라이브옵스 반응 강화"),
-    (91, "시나리오 6 · 변동성 높은 혼합"),
+    (11, "시나리오 1 · 런칭기 · 안정형 밸런스",      "launch"),
+    (27, "시나리오 2 · 런칭기 · 고효율 매체 강세",    "launch"),
+    (42, "시나리오 3 · 런칭기 · 기본 추천 시나리오",  "launch"),
+    (58, "시나리오 4 · 유지기 · 효율 집중 운영",      "sustain"),
+    (73, "시나리오 5 · 유지기 · 라이브옵스 반응 강화", "sustain"),
+    (91, "시나리오 6 · 유지기 · 변동성 높은 혼합",    "sustain"),
 ]
 DUMMY_LIVEOPS_START = "2026-01-15"
 DUMMY_LIVEOPS_END   = "2026-01-21"
@@ -67,7 +69,7 @@ DATA_STATE_KEYS     = ["canonical", "raw_bundle"]
 if "canonical" not in st.session_state:
     try:
         _mmp = "AppsFlyer"
-        _i, _e, _c = get_mmp_raw_bundle(mmp=_mmp, seed=42)
+        _i, _e, _c = get_mmp_raw_bundle(mmp=_mmp, seed=42, phase="launch")
         _adapter   = ADAPTER_REGISTRY[_mmp]()
         _canonical = coerce_canonical_types(
             installs=_adapter.normalize_installs(_i),
@@ -162,6 +164,19 @@ def _style_decision_table(df: pd.DataFrame):
     return df.style.apply(row_color, axis=1).format(
         {"목표 대비 ROAS 차이(%)": "{:.1f}%", "최소 설치수 대비 차이": "{:+.0f}"}, na_rep="-"
     )
+
+
+def _show_data_period(canonical) -> None:
+    """현재 로딩된 데이터의 기간을 작은 배지로 표시."""
+    if canonical is None:
+        return
+    try:
+        min_d = pd.to_datetime(canonical.installs["install_time"]).min().strftime("%Y-%m-%d")
+        max_d = pd.to_datetime(canonical.installs["install_time"]).max().strftime("%Y-%m-%d")
+        total_installs = len(canonical.installs)
+        st.caption(f"📅 데이터 기간: **{min_d} ~ {max_d}** · 총 설치수: **{total_installs:,}명**")
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -271,21 +286,24 @@ with tab_upload:
     st.markdown("#### ⚡ 빠른 체험 — 더미 시나리오")
     st.caption("시드가 달라지면 매체 순위·성과가 완전히 달라집니다. 실무처럼 정해진 답이 없는 데이터입니다.")
 
-    scenario_labels = [label for _, label in DUMMY_SCENARIO_OPTIONS]
-    label_to_seed   = {label: seed for seed, label in DUMMY_SCENARIO_OPTIONS}
-    q1, q2          = st.columns([1, 2])
-    selected_label  = q1.selectbox("시나리오 선택", scenario_labels, index=2, key="upload_scenario")
-    use_custom_seed = q1.checkbox("시드 직접 입력 (고급)", value=False, key="upload_custom_seed")
-    dummy_seed      = label_to_seed[selected_label]
+    scenario_labels   = [label for _, label, _ in DUMMY_SCENARIO_OPTIONS]
+    label_to_scenario = {label: (seed, phase) for seed, label, phase in DUMMY_SCENARIO_OPTIONS}
+    q1, q2            = st.columns([1, 2])
+    selected_label    = q1.selectbox("시나리오 선택", scenario_labels, index=2, key="upload_scenario")
+    use_custom_seed   = q1.checkbox("시드 직접 입력 (고급)", value=False, key="upload_custom_seed")
+    dummy_seed, dummy_phase = label_to_scenario[selected_label]
     if use_custom_seed:
-        dummy_seed = q1.number_input("시드 번호", min_value=0, value=int(dummy_seed), step=1, key="upload_seed_num")
+        dummy_seed  = q1.number_input("시드 번호", min_value=0, value=int(dummy_seed), step=1, key="upload_seed_num")
+        dummy_phase = q1.selectbox("단계", ["launch", "sustain"], key="upload_phase",
+                                   help="launch=런칭기(7~10억/월), sustain=유지기(1.5~3억/월)")
 
     if q2.button("더미 데이터 불러오기", use_container_width=True):
         try:
-            _i, _e, _c  = get_mmp_raw_bundle(mmp=_DUMMY_MMP, seed=int(dummy_seed))
+            _i, _e, _c  = get_mmp_raw_bundle(mmp=_DUMMY_MMP, seed=int(dummy_seed), phase=dummy_phase)
             _canonical  = _normalize_uploaded_data(_DUMMY_MMP, _i, _e, _c)
             _set_loaded_bundle(_canonical, {"mmp": _DUMMY_MMP, "installs_raw": _i, "events_raw": _e, "cost_raw": _c})
-            st.success(f"더미 데이터 로드 완료 (시드: {int(dummy_seed)})")
+            phase_label = "런칭기" if dummy_phase == "launch" else "유지기"
+            st.success(f"더미 데이터 로드 완료 ({phase_label} · 시드: {int(dummy_seed)})")
             st.session_state["_auto_loaded"] = False
         except Exception as exc:
             st.error("더미 데이터 로드 중 오류가 발생했습니다.")
@@ -379,6 +397,7 @@ canonical = st.session_state.get("canonical")
 # ══════════════════════════════════════════════
 with tab_decision:
     st.subheader("UA 판단")
+    _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
         st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
@@ -477,6 +496,7 @@ with tab_decision:
 # ══════════════════════════════════════════════
 with tab_budget:
     st.subheader("💰 예산 배분 추천")
+    _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
         st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
@@ -562,6 +582,7 @@ with tab_budget:
 # ══════════════════════════════════════════════
 with tab_curve:
     st.subheader("코호트 곡선")
+    _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
         st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
@@ -606,6 +627,7 @@ with tab_curve:
 # ══════════════════════════════════════════════
 with tab_liveops:
     st.subheader("라이브옵스 영향")
+    _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
         st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")

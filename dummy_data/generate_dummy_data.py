@@ -142,8 +142,21 @@ def _sample_creative_profiles(rng: np.random.Generator) -> list:
     return creatives
 
 
-def generate_canonical_dummy_data(seed: int = 42):
+def generate_canonical_dummy_data(seed: int = 42, phase: str = "launch"):
+    """
+    phase 파라미터로 운영 단계별 예산 규모를 현실적으로 조정.
+    "launch"  (사전예약~런칭기): 7~10억/월 — 다수 매체 동시 집행, 물량 공세
+    "sustain" (유지기):          1.5~3억/월 — 효율 매체 중심, 보수적 운영
+    CPI·ROAS 등 효율 지표는 그대로 유지하고 절대 비용 규모만 달라짐.
+    """
     rng = np.random.default_rng(seed)
+
+    # 단계별 설치수 스케일 계수
+    if phase == "launch":
+        install_scale = rng.uniform(1.6, 2.0)   # 현재 대비 1.6~2.0배 → 월 7~10억
+    else:  # sustain
+        install_scale = rng.uniform(0.35, 0.55)  # 현재 대비 0.35~0.55배 → 월 1.5~3억
+
     start = pd.Timestamp("2026-01-01")
     days = 30
 
@@ -181,7 +194,7 @@ def generate_canonical_dummy_data(seed: int = 42):
                 campaign_mult = rng.uniform(0.90, 1.15)
 
                 lo, hi = profile["daily_install_range"]
-                daily_installs = int(rng.integers(lo, hi))
+                daily_installs = int(rng.integers(lo, hi) * install_scale)
 
                 creative_installs = rng.multinomial(daily_installs, creative_probs)
                 campaign_user_keys = []
@@ -333,10 +346,10 @@ MMP_CONVERTERS = {
 }
 
 
-def get_mmp_raw_bundle(mmp: str, seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def get_mmp_raw_bundle(mmp: str, seed: int = 42, phase: str = "launch") -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if mmp not in MMP_CONVERTERS:
         raise ValueError(f"Unsupported MMP: {mmp}")
-    installs, events, cost = generate_canonical_dummy_data(seed=seed)
+    installs, events, cost = generate_canonical_dummy_data(seed=seed, phase=phase)
     return MMP_CONVERTERS[mmp](installs, events, cost)
 
 
