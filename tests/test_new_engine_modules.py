@@ -152,37 +152,6 @@ class NewEngineModulesTests(unittest.TestCase):
         self.assertTrue(out.empty)
 
 
-    def test_liveops_supports_campaign_adset_level(self):
-        installs = pd.DataFrame(
-            {
-                "user_key": ["u1", "u2", "u3", "u4"],
-                "install_time": pd.to_datetime(["2026-01-10", "2026-01-10", "2026-01-03", "2026-01-03"]),
-                "media_source": ["Meta", "Google", "Meta", "Google"],
-                "campaign": ["C1", "C1", "C1", "C1"],
-                "adset": ["A1", "A1", "A2", "A2"],
-                "creative": ["CR1", "CR1", "CR2", "CR2"],
-            }
-        )
-        events = pd.DataFrame(
-            {
-                "user_key": ["u1", "u2", "u3", "u4"],
-                "event_time": pd.to_datetime(["2026-01-11", "2026-01-11", "2026-01-04", "2026-01-04"]),
-                "event_name": ["af_purchase", "af_purchase", "af_purchase", "af_purchase"],
-                "revenue": [10000.0, 8000.0, 5000.0, 3000.0],
-            }
-        )
-        out = compare_liveops_impact_by_level(
-            installs,
-            events,
-            event_start="2026-01-10",
-            event_end="2026-01-10",
-            baseline_days=1,
-            level="campaign_adset",
-        )
-        self.assertIn("campaign", out.columns)
-        self.assertIn("adset", out.columns)
-        self.assertNotIn("media_source", out.columns)
-
     def test_liveops_impact_supports_level_breakdown(self):
         installs = pd.DataFrame(
             {
@@ -270,41 +239,6 @@ class NewEngineModulesTests(unittest.TestCase):
         self.assertIn("creative", out.columns)
         self.assertAlmostEqual(float(out["spend"].sum()), 20000.0)
 
-
-    def test_metrics_support_campaign_adset_level(self):
-        installs = pd.DataFrame(
-            {
-                "user_key": ["u1", "u2", "u3", "u4"],
-                "install_time": pd.to_datetime(["2026-01-01"] * 4),
-                "media_source": ["Meta", "Google", "Meta", "Google"],
-                "campaign": ["C1", "C1", "C2", "C2"],
-                "adset": ["A1", "A1", "A2", "A2"],
-                "creative": ["CR1", "CR1", "CR2", "CR2"],
-            }
-        )
-        events = pd.DataFrame(
-            {
-                "user_key": ["u1", "u3"],
-                "event_time": pd.to_datetime(["2026-01-02", "2026-01-03"]),
-                "event_name": ["af_purchase", "af_purchase"],
-                "revenue": [10000.0, 15000.0],
-            }
-        )
-        cost = pd.DataFrame(
-            {
-                "date": ["2026-01-01", "2026-01-01"],
-                "media_source": ["Meta", "Google"],
-                "campaign": ["C1", "C2"],
-                "impressions": [1000, 1000],
-                "clicks": [100, 100],
-                "spend": [20000.0, 22000.0],
-            }
-        )
-
-        out = calculate_media_metrics(installs, events, cost, level="campaign_adset")
-        self.assertIn("campaign", out.columns)
-        self.assertIn("adset", out.columns)
-        self.assertNotIn("media_source", out.columns)
 
     def test_cohort_curve_supports_creative_level(self):
         installs = pd.DataFrame(

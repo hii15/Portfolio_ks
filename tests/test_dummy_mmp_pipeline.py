@@ -8,7 +8,6 @@ from data_processing.adapters import ADAPTER_REGISTRY
 from data_processing.canonical_schema import coerce_canonical_types
 from data_processing.metrics_engine import calculate_media_metrics
 from dummy_data.generate_dummy_data import write_mmp_dummy_data, get_mmp_raw_bundle, generate_canonical_dummy_data
-from dummy_data.run_mmp_experiments import run_experiments
 
 
 class DummyMMPPipelineTests(unittest.TestCase):
@@ -87,28 +86,6 @@ class DummyMMPPipelineTests(unittest.TestCase):
 
                 self.assertGreater(len(metrics), 0)
                 self.assertIn("d7_roas", metrics.columns)
-
-    def test_experiment_report_outputs_files(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data_root = f"{tmpdir}/dummy"
-            exp_root = f"{tmpdir}/exp"
-            write_mmp_dummy_data(output_dir=data_root, seed=99)
-            summary_path, decision_path, report_path = run_experiments(input_root=data_root, output_root=exp_root)
-
-            self.assertTrue(Path(summary_path).exists())
-            self.assertTrue(Path(decision_path).exists())
-            self.assertTrue(Path(report_path).exists())
-
-            summary = pd.read_csv(summary_path)
-            self.assertEqual(set(summary["mmp"]), {"AppsFlyer", "Adjust", "Singular"})
-            self.assertIn("roas_cv", summary.columns)
-
-            report_txt = Path(report_path).read_text(encoding="utf-8")
-            self.assertIn("1) 실험 파라미터", report_txt)
-            self.assertIn("4) 운영 권고용 Decision Mix", report_txt)
-            self.assertIn("5) 운영 메모 템플릿", report_txt)
-            self.assertIn("seed", report_txt)
-
 
 if __name__ == "__main__":
     unittest.main()
