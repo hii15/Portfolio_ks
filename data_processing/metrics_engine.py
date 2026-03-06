@@ -120,3 +120,117 @@ def calculate_cohort_curve(installs: pd.DataFrame, events: pd.DataFrame, max_day
             rows.append({**{c: row[c] for c in group_cols}, "segment": segment_label, "day": day, "cum_revenue": cum_revenue, "ltv": ltv})
 
     return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────
+# ROAS 분해: "CPI 문제냐, LTV 문제냐"
+# ─────────────────────────────────────────────────────────────
+def decompose_roas_change(
+    metrics_current: pd.DataFrame,
+    metrics_prev: pd.DataFrame,
+    group_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    두 기간 사이의 D7 ROAS 변화를 CPI 기여분 / LTV 기여분으로 분해.
+
+    수식 근거:
+        ROAS = D7_LTV / CPI
+        ΔROAS ≈ (ΔLTV / CPI_prev) - (LTV_prev × ΔCPI / CPI_prev²)
+
+    반환 컬럼:
+        roas_prev, roas_curr, roas_delta
+        cpi_prev, cpi_curr, cpi_contribution  ← CPI 변화가 ROAS에 준 영향
+        ltv_prev, ltv_curr, ltv_contribution  ← LTV 변화가 ROAS에 준 영향
+        dominant_cause  ← "CPI 문제" / "LTV 문제" / "복합"
+    """
+    if group_cols is None:
+        group_cols = ["media_source"]
+
+    keep = group_cols + ["d7_roas", "cpi", "d7_ltv"]
+    curr = metrics_current[keep].rename(columns={
+        "d7_roas": "roas_curr", "cpi": "cpi_curr", "d7_ltv": "ltv_curr"
+    })
+    prev = metrics_prev[keep].rename(columns={
+        "d7_roas": "roas_prev", "cpi": "cpi_prev", "d7_ltv": "ltv_prev"
+    })
+
+    df = curr.merge(prev, on=group_cols, how="inner")
+    if df.empty:
+        return df
+
+    df["roas_delta"] = df["roas_curr"] - df["roas_prev"]
+
+    # CPI 기여: CPI가 올라서 ROAS가 얼마나 빠졌나
+    safe_cpi = df["cpi_prev"].clip(lower=1)
+    df["cpi_contribution"] = -(df["ltv_prev"] * (df["cpi_curr"] - df["cpi_prev"]) / safe_cpi ** 2)
+
+    # LTV 기여: LTV가 변해서 ROAS가 얼마나 달라졌나
+    df["ltv_contribution"] = (df["ltv_curr"] - df["ltv_prev"]) / safe_cpi
+
+    # 주요 원인 분류
+    def _cause(row):
+        cpi_c = abs(row["cpi_contribution"])
+        ltv_c = abs(row["ltv_contribution"])
+        if cpi_c == 0 and ltv_c == 0:
+            return "변화 없음"
+        ratio = cpi_c / (cpi_c + ltv_c) if (cpi_c + ltv_c) > 0 else 0.5
+        if ratio >= 0.65:
+            return "CPI 문제"
+        if ratio <= 0.35:
+            return "LTV 문제"
+        return "복합 요인"
+
+    df["dominant_cause"] = df.apply(_cause, axis=1)
+
+    return df[group_cols + [
+        "roas_prev", "roas_curr", "roas_delta",
+        "cpi_prev", "cpi_curr", "cpi_contribution",
+        "ltv_prev", "ltv_curr", "ltv_contribution",
+        "dominant_cause",
+    ]].reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# 코호트 성숙도 체크 (Attribution Lag 가드레일)
+# ─────────────────────────────────────────────────────────────
+def check_cohort_maturity(
+    installs: pd.DataFrame,
+    reference_date: pd.Timestamp | None = None,
+    min_days: int = 7,
+) -> pd.DataFrame:
+    """
+    D7 판단에 사용하기에 충분히 '익은' 코호트인지 확인.
+
+    로직:
+        install_date 기준으로 reference_date(기본: 데이터 마지막 날)까지
+        경과 일수가 min_days 미만이면 IMMATURE 플래그.
+
+    반환:
+        install_date, cohort_age_days, is_mature, immature_installs, total_installs
+    """
+    if reference_date is None:
+        reference_date = pd.to_datetime(installs["install_time"]).max()
+
+    inst = installs.copy()
+    inst["install_date"] = pd.to_datetime(inst["install_time"]).dt.normalize()
+    inst["cohort_age_days"] = (reference_date - inst["install_date"]).dt.days
+    inst["is_mature"] = inst["cohort_age_days"] >= min_days
+
+    summary = inst.groupby("install_date").agg(
+        total_installs   =("user_key",        "count"),
+        cohort_age_days  =("cohort_age_days",  "first"),
+        is_mature        =("is_mature",         "first"),
+    ).reset_index()
+
+    # 전체 요약
+    total        = len(inst)
+    immature_n   = int((~inst["is_mature"]).sum())
+    immature_pct = immature_n / total * 100 if total > 0 else 0
+
+    summary.attrs["immature_installs"]    = immature_n
+    summary.attrs["immature_pct"]         = immature_pct
+    summary.attrs["total_installs"]       = total
+    summary.attrs["reference_date"]       = str(reference_date.date())
+    summary.attrs["min_days"]             = min_days
+
+    return summary

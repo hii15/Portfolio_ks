@@ -11,7 +11,7 @@ from data_processing.canonical_schema import (
     format_validation_issues,
     validate_canonical_bundle_detailed,
 )
-from data_processing.metrics_engine import calculate_media_metrics, calculate_cohort_curve
+from data_processing.metrics_engine import calculate_media_metrics, calculate_cohort_curve, decompose_roas_change, check_cohort_maturity
 from data_processing.decision_engine import apply_decision_logic
 from data_processing.liveops_analysis import compare_liveops_impact_by_level, derive_liveops_actions
 from data_processing.raw_templates import get_raw_template_bundle
@@ -507,13 +507,24 @@ with tab_decision:
 
             # 메인 테이블
             st.markdown("#### 🗂️ 세그먼트별 상세 판단")
+
+            CONFIDENCE_LABEL_MAP = {
+                "높음": "🟢 높음",
+                "보통": "🟡 보통",
+                "낮음": "🔴 낮음",
+            }
+
             decision_view = decision_df.copy()
             decision_view["decision"]        = decision_view["decision"].map(DECISION_LABEL_MAP).fillna(decision_view["decision"])
-            decision_view["decision_reason"] = decision_view["decision_reason"].apply(_friendly_decision_reason)
+            decision_view["decision_reason"] = decision_view["decision_reason"]  # 이미 rich reason
             decision_view["efficiency_note"] = decision_view["efficiency_note"].apply(lambda x: EFFICIENCY_NOTE_MAP.get(str(x), str(x)))
+            decision_view["confidence"]      = decision_view["confidence"].map(CONFIDENCE_LABEL_MAP).fillna(decision_view["confidence"])
             decision_view = decision_view.rename(columns={
                 "decision":               "판단",
                 "decision_reason":        "판단 사유",
+                "action":                 "권장 액션",
+                "confidence":             "신뢰도",
+                "confidence_note":        "신뢰도 근거",
                 "efficiency_note":        "효율 상태",
                 "roas_gap_vs_target_pct": "목표 대비 ROAS 차이(%)",
                 "install_gap_to_min":     "최소 설치수 대비 차이",
@@ -522,6 +533,118 @@ with tab_decision:
             st.download_button("📥 판단 결과 CSV", data=_to_csv_bytes(decision_view),
                                file_name="ua_decision_table.csv", mime="text/csv",
                                use_container_width=True, key="dl_decision")
+
+            # ── [NEW] 신뢰도 분포 요약 ──
+            st.markdown("#### 🎯 신뢰도 분포")
+            conf_counts = decision_df["confidence"].value_counts().to_dict()
+            cf1, cf2, cf3 = st.columns(3)
+            cf1.metric("🟢 높음", int(conf_counts.get("높음", 0)), help="설치수 ≥ 최소기준×3 + 구매자 ≥ 30명")
+            cf2.metric("🟡 보통", int(conf_counts.get("보통", 0)), help="설치수 ≥ 최소기준 + 구매자 ≥ 10명")
+            cf3.metric("🔴 낮음", int(conf_counts.get("낮음", 0)), help="표본 부족 — 판단 보수적으로 해석 필요")
+
+            # ── [NEW] 코호트 성숙도 가드레일 ──
+            st.markdown("#### 🕐 코호트 성숙도 체크 (Attribution Lag 가드레일)")
+            maturity = check_cohort_maturity(period_installs, min_days=7)
+            immature_n   = maturity.attrs.get("immature_installs", 0)
+            immature_pct = maturity.attrs.get("immature_pct", 0.0)
+            total_n      = maturity.attrs.get("total_installs", 0)
+            ref_date     = maturity.attrs.get("reference_date", "-")
+
+            if immature_pct > 20:
+                st.warning(
+                    f"⚠️ **D7 미성숙 코호트 비중 {immature_pct:.1f}%** ({immature_n:,}명 / 전체 {total_n:,}명) — "
+                    f"설치 후 7일이 지나지 않은 유저가 포함되어 D7 ROAS가 **과소 추정**되었을 수 있습니다. "
+                    f"기준일: {ref_date}"
+                )
+            elif immature_pct > 0:
+                st.info(
+                    f"ℹ️ D7 미성숙 코호트 {immature_pct:.1f}% ({immature_n:,}명) 포함 — "
+                    f"비중이 낮아 판단에 미치는 영향은 제한적입니다."
+                )
+            else:
+                st.success("✅ 모든 코호트가 D7 기준을 충족했습니다. ROAS 수치를 신뢰할 수 있습니다.")
+
+            with st.expander("날짜별 코호트 성숙도 상세", expanded=False):
+                maturity_view = maturity.rename(columns={
+                    "install_date":    "설치일",
+                    "cohort_age_days": "경과일",
+                    "is_mature":       "D7 성숙 여부",
+                    "total_installs":  "설치수",
+                })
+                maturity_view["D7 성숙 여부"] = maturity_view["D7 성숙 여부"].map({True: "✅ 성숙", False: "⚠️ 미성숙"})
+                st.dataframe(maturity_view, use_container_width=True)
+
+            # ── [NEW] ROAS 분해: CPI 문제 vs LTV 문제 ──
+            st.markdown("#### 🔬 ROAS 분해 — CPI 문제인가, LTV 문제인가")
+            st.caption("현재 기간 vs 직전 동일 길이 기간을 비교합니다. 기간이 충분하지 않으면 분해가 생략됩니다.")
+
+            try:
+                # 현재 기간과 동일한 길이의 직전 기간 자동 계산
+                _curr_dates = pd.to_datetime(period_installs["install_time"]).dt.normalize()
+                _curr_start = _curr_dates.min()
+                _curr_end   = _curr_dates.max()
+                _period_len = (_curr_end - _curr_start).days + 1
+                _prev_end   = _curr_start - pd.Timedelta(days=1)
+                _prev_start = _prev_end - pd.Timedelta(days=_period_len - 1)
+
+                _prev_installs = _filter_by_daterange(
+                    filtered_installs, _prev_start.date(), _prev_end.date()
+                )
+
+                if len(_prev_installs) < 100:
+                    st.info("직전 기간 데이터가 부족해 ROAS 분해를 건너뜁니다. 분석 기간을 더 짧게 설정하면 비교가 가능해집니다.")
+                else:
+                    _grp = [c for c in ["media_source", "campaign"] if c in metrics.columns][:1]
+                    _m_prev = calculate_media_metrics(_prev_installs, canonical.events, canonical.cost, level=decision_level)
+                    decomp   = decompose_roas_change(metrics, _m_prev, group_cols=_grp)
+
+                    if decomp.empty:
+                        st.info("두 기간에 공통으로 집행된 세그먼트가 없어 분해를 건너뜁니다.")
+                    else:
+                        # 주요 원인별 색상
+                        def _style_decomp(row):
+                            cause = str(row.get("주요 원인", ""))
+                            if "CPI" in cause:
+                                return ["background-color: #fde8e8"] * len(row)
+                            if "LTV" in cause:
+                                return ["background-color: #e8f4fd"] * len(row)
+                            if "복합" in cause:
+                                return ["background-color: #fff3cd"] * len(row)
+                            return [""] * len(row)
+
+                        decomp_view = decomp.rename(columns={
+                            "media_source":    "매체",
+                            "roas_prev":       "이전 ROAS",
+                            "roas_curr":       "현재 ROAS",
+                            "roas_delta":      "ROAS 변화",
+                            "cpi_prev":        "이전 CPI",
+                            "cpi_curr":        "현재 CPI",
+                            "cpi_contribution":"CPI 기여분",
+                            "ltv_prev":        "이전 LTV",
+                            "ltv_curr":        "현재 LTV",
+                            "ltv_contribution":"LTV 기여분",
+                            "dominant_cause":  "주요 원인",
+                        })
+
+                        # 원인별 요약 배지
+                        cause_counts = decomp_view["주요 원인"].value_counts().to_dict()
+                        dc1, dc2, dc3 = st.columns(3)
+                        dc1.metric("🔴 CPI 문제",  int(cause_counts.get("CPI 문제",  0)), help="CPI 상승이 ROAS 하락의 주원인")
+                        dc2.metric("🔵 LTV 문제",  int(cause_counts.get("LTV 문제",  0)), help="LTV 하락이 ROAS 하락의 주원인")
+                        dc3.metric("🟡 복합 요인", int(cause_counts.get("복합 요인", 0)), help="CPI와 LTV 변화가 비슷한 비중으로 영향")
+
+                        styled_decomp = decomp_view.style.apply(_style_decomp, axis=1).format({
+                            "이전 ROAS": "{:.3f}", "현재 ROAS": "{:.3f}", "ROAS 변화": "{:+.3f}",
+                            "이전 CPI":  "{:,.0f}", "현재 CPI":  "{:,.0f}",
+                            "CPI 기여분":"{:+.3f}",
+                            "이전 LTV":  "{:,.0f}", "현재 LTV":  "{:,.0f}",
+                            "LTV 기여분":"{:+.3f}",
+                        }, na_rep="-")
+                        st.dataframe(styled_decomp, use_container_width=True)
+                        st.caption("🔴 빨간 행 = CPI 문제 · 🔵 파란 행 = LTV 문제 · 🟡 노란 행 = 복합 요인")
+
+            except Exception as _e:
+                st.info(f"ROAS 분해를 계산할 수 없습니다: {_e}")
 
 
 # ══════════════════════════════════════════════
