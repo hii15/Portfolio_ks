@@ -594,43 +594,46 @@ with tab_decision:
                                use_container_width=True, key="dl_decision")
 
             st.markdown("##### 선택 세그먼트 상세")
-            selected_segment = st.selectbox(
-                "판단 근거와 세부 지표를 볼 세그먼트",
-                options=decision_detail.index.tolist(),
-                format_func=lambda idx: decision_detail.at[idx, "세그먼트"],
-                key="decision_segment_detail",
-            )
-            selected = decision_detail.loc[selected_segment]
-            dc1, dc2, dc3, dc4 = st.columns(4)
-            dc1.metric("D7 ROAS", f"{selected['d7_roas']:.1%}")
-            dc2.metric("목표 대비", f"{selected['roas_gap_vs_target_pct']:+.1f}%")
-            dc3.metric("CPI", f"₩{selected['cpi']:,.0f}")
-            dc4.metric("D7 LTV", f"₩{selected['d7_ltv']:,.0f}")
-            st.info(f"**판단 근거**  {selected['decision_reason']}")
-            st.success(f"**다음 행동**  {selected['action']}")
-
-            with st.expander("성장 · 품질 · 데이터 신뢰도 상세", expanded=False):
-                detail_columns = [
-                    "세그먼트", "installs", "spend", "impressions", "clicks", "purchasers",
-                    "purchase_rate", "d1_roas", "d7_roas", "d1_ltv", "d7_ltv", "arpu", "arppu",
-                    "confidence_note", "데이터 신뢰도",
-                ]
-                available_detail_columns = [c for c in detail_columns if c in decision_detail.columns]
-                detail_view = decision_detail.loc[[selected_segment], available_detail_columns].rename(columns={
-                    "installs": "설치", "spend": "광고비", "impressions": "노출", "clicks": "클릭",
-                    "purchasers": "구매자", "purchase_rate": "구매율", "d1_roas": "D1 ROAS",
-                    "d7_roas": "D7 ROAS", "d1_ltv": "D1 LTV", "d7_ltv": "D7 LTV",
-                    "arpu": "ARPU", "arppu": "ARPPU", "confidence_note": "표본 근거",
-                })
-                st.dataframe(
-                    detail_view.style.format({
-                        "설치": "{:,.0f}", "광고비": "₩{:,.0f}", "노출": "{:,.0f}", "클릭": "{:,.0f}",
-                        "구매자": "{:,.0f}", "구매율": "{:.1%}", "D1 ROAS": "{:.1%}", "D7 ROAS": "{:.1%}",
-                        "D1 LTV": "₩{:,.0f}", "D7 LTV": "₩{:,.0f}", "ARPU": "₩{:,.0f}", "ARPPU": "₩{:,.0f}",
-                    }),
-                    use_container_width=True,
-                    hide_index=True,
+            if decision_detail.empty:
+                st.info("선택한 분석 레벨에 비교 가능한 세그먼트가 없습니다. 매체 또는 캠페인 레벨로 바꿔 확인해 주세요.")
+            else:
+                selected_segment = st.selectbox(
+                    "판단 근거와 세부 지표를 볼 세그먼트",
+                    options=decision_detail.index.tolist(),
+                    format_func=lambda idx: decision_detail.at[idx, "세그먼트"],
+                    key="decision_segment_detail",
                 )
+                selected = decision_detail.loc[selected_segment]
+                dc1, dc2, dc3, dc4 = st.columns(4)
+                dc1.metric("D7 ROAS", f"{selected['d7_roas']:.1%}")
+                dc2.metric("목표 대비", f"{selected['roas_gap_vs_target_pct']:+.1f}%")
+                dc3.metric("CPI", f"₩{selected['cpi']:,.0f}")
+                dc4.metric("D7 LTV", f"₩{selected['d7_ltv']:,.0f}")
+                st.info(f"**판단 근거**  {selected['decision_reason']}")
+                st.success(f"**다음 행동**  {selected['action']}")
+
+                with st.expander("성장 · 품질 · 데이터 신뢰도 상세", expanded=False):
+                    detail_columns = [
+                        "세그먼트", "installs", "spend", "impressions", "clicks", "purchasers",
+                        "purchase_rate", "d1_roas", "d7_roas", "d1_ltv", "d7_ltv", "arpu", "arppu",
+                        "confidence_note", "데이터 신뢰도",
+                    ]
+                    available_detail_columns = [c for c in detail_columns if c in decision_detail.columns]
+                    detail_view = decision_detail.loc[[selected_segment], available_detail_columns].rename(columns={
+                        "installs": "설치", "spend": "광고비", "impressions": "노출", "clicks": "클릭",
+                        "purchasers": "구매자", "purchase_rate": "구매율", "d1_roas": "D1 ROAS",
+                        "d7_roas": "D7 ROAS", "d1_ltv": "D1 LTV", "d7_ltv": "D7 LTV",
+                        "arpu": "ARPU", "arppu": "ARPPU", "confidence_note": "표본 근거",
+                    })
+                    st.dataframe(
+                        detail_view.style.format({
+                            "설치": "{:,.0f}", "광고비": "₩{:,.0f}", "노출": "{:,.0f}", "클릭": "{:,.0f}",
+                            "구매자": "{:,.0f}", "구매율": "{:.1%}", "D1 ROAS": "{:.1%}", "D7 ROAS": "{:.1%}",
+                            "D1 LTV": "₩{:,.0f}", "D7 LTV": "₩{:,.0f}", "ARPU": "₩{:,.0f}", "ARPPU": "₩{:,.0f}",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
             # ── [NEW] 신뢰도 분포 요약 ──
             st.markdown("#### 🎯 신뢰도 분포")
