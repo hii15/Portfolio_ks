@@ -24,6 +24,8 @@ def _resolve_group_cols(level: str) -> list[str]:
 def _cohort_events(installs: pd.DataFrame, events: pd.DataFrame, max_day: int = 30) -> pd.DataFrame:
     dim_cols = [c for c in ["media_source", "campaign", "adset", "creative"] if c in installs.columns]
     merged = installs[["user_key", "install_time", *dim_cols]].merge(events, on="user_key", how="left")
+    merged["install_time"] = pd.to_datetime(merged["install_time"], errors="coerce")
+    merged["event_time"] = pd.to_datetime(merged["event_time"], errors="coerce")
     merged["day_diff"] = (merged["event_time"] - merged["install_time"]).dt.days
     return merged[merged["day_diff"].between(0, max_day, inclusive="both")].copy()
 
@@ -35,16 +37,43 @@ def _purchase_events(events: pd.DataFrame) -> pd.DataFrame:
     return events[names.isin(PURCHASE_EVENT_NAMES)].copy()
 
 
+def filter_cost_by_daterange(cost: pd.DataFrame, start_date=None, end_date=None) -> pd.DataFrame:
+    """설치 코호트 기간과 같은 날짜의 광고비만 사용한다."""
+    if cost.empty or (start_date is None and end_date is None):
+        return cost.copy()
+    out = cost.copy()
+    dates = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    if start_date is not None:
+        out = out[dates >= pd.Timestamp(start_date).normalize()]
+        dates = dates.loc[out.index]
+    if end_date is not None:
+        out = out[dates <= pd.Timestamp(end_date).normalize()]
+    return out.copy()
+
+
 def _allocate_cost_by_level(installs: pd.DataFrame, cost: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    """비용을 분석 레벨로 집계하고, 추정 배분 여부를 함께 반환한다."""
     parent_keys = [k for k in CAMPAIGN_KEYS if k in group_cols]
     if not parent_keys:
         parent_keys = ["media_source"]
+
+    # 비용 원본에 현재 분석 레벨이 모두 들어 있으면 실제 비용으로 직접 집계한다.
+    # 일부 행만 하위 레벨 키가 있으면 나머지 비용이 사라질 수 있으므로,
+    # 모든 비용 행에 키가 있는 경우에만 실제 비용으로 취급한다.
+    has_actual_level_cost = all(c in cost.columns and cost[c].notna().all() for c in group_cols)
+    if has_actual_level_cost:
+        actual = cost.groupby(group_cols, as_index=False).agg(
+            spend=("spend", "sum"), impressions=("impressions", "sum"), clicks=("clicks", "sum")
+        )
+        actual["cost_is_estimated"] = False
+        return actual
 
     cost_parent = cost.groupby(parent_keys, as_index=False).agg(
         spend=("spend", "sum"), impressions=("impressions", "sum"), clicks=("clicks", "sum")
     )
 
     if group_cols == parent_keys:
+        cost_parent["cost_is_estimated"] = False
         return cost_parent
 
     install_counts = installs.groupby(group_cols, as_index=False).agg(installs=("user_key", "nunique"))
@@ -57,10 +86,18 @@ def _allocate_cost_by_level(installs: pd.DataFrame, cost: pd.DataFrame, group_co
     for col in ["spend", "impressions", "clicks"]:
         allocated[col] = allocated[col].fillna(0) * share
 
-    return allocated[group_cols + ["spend", "impressions", "clicks"]]
+    allocated["cost_is_estimated"] = True
+    return allocated[group_cols + ["spend", "impressions", "clicks", "cost_is_estimated"]]
 
 
-def calculate_media_metrics(installs: pd.DataFrame, events: pd.DataFrame, cost: pd.DataFrame, level: str = "campaign") -> pd.DataFrame:
+def calculate_media_metrics(
+    installs: pd.DataFrame,
+    events: pd.DataFrame,
+    cost: pd.DataFrame,
+    level: str = "campaign",
+    cost_start_date=None,
+    cost_end_date=None,
+) -> pd.DataFrame:
     group_cols = _resolve_group_cols(level)
 
     installs = installs.copy()
@@ -79,10 +116,22 @@ def calculate_media_metrics(installs: pd.DataFrame, events: pd.DataFrame, cost: 
         purchase_revenue=("revenue", "sum"),
     )
 
-    cost_agg = _allocate_cost_by_level(installs, cost, group_cols)
+    # 호출자가 날짜를 넘기지 않아도 설치 코호트의 기간에 맞춰 비용을 제한한다.
+    if cost_start_date is None and not installs.empty:
+        cost_start_date = installs["install_time"].min()
+    if cost_end_date is None and not installs.empty:
+        cost_end_date = installs["install_time"].max()
+    cost_agg = _allocate_cost_by_level(
+        installs,
+        filter_cost_by_daterange(cost, cost_start_date, cost_end_date),
+        group_cols,
+    )
 
     result = install_agg.merge(rev, on=group_cols, how="left").merge(cost_agg, on=group_cols, how="left")
     result = result.fillna(0)
+    for col in ["installs", "d1_revenue", "d7_revenue", "d30_revenue", "purchasers", "purchase_revenue", "spend", "impressions", "clicks"]:
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0.0)
 
     result["cpi"] = np.where(result["installs"] > 0, result["spend"] / result["installs"], np.nan)
     result["purchase_rate"] = np.where(result["installs"] > 0, result["purchasers"] / result["installs"], 0)
@@ -92,6 +141,7 @@ def calculate_media_metrics(installs: pd.DataFrame, events: pd.DataFrame, cost: 
     result["d7_ltv"] = np.where(result["installs"] > 0, result["d7_revenue"] / result["installs"], 0)
     result["d1_roas"] = np.where(result["spend"] > 0, result["d1_revenue"] / result["spend"], 0)
     result["d7_roas"] = np.where(result["spend"] > 0, result["d7_revenue"] / result["spend"], 0)
+    result["roas_is_estimated"] = result.get("cost_is_estimated", False).fillna(False).astype(bool)
 
     daily_recovery = np.where(result["d7_revenue"] > 0, result["d7_revenue"] / 7.0, np.nan)
     result["payback_period_days"] = np.where(daily_recovery > 0, result["spend"] / daily_recovery, np.nan)
@@ -234,3 +284,18 @@ def check_cohort_maturity(
     summary.attrs["min_days"]             = min_days
 
     return summary
+
+
+def filter_mature_cohorts(
+    installs: pd.DataFrame,
+    reference_date: pd.Timestamp | None = None,
+    min_days: int = 7,
+) -> pd.DataFrame:
+    """D7 판단에 사용할 수 있는 코호트만 남긴다."""
+    if installs.empty:
+        return installs.copy()
+    if reference_date is None:
+        reference_date = pd.to_datetime(installs["install_time"]).max()
+    reference_date = pd.Timestamp(reference_date).normalize()
+    ages = (reference_date - pd.to_datetime(installs["install_time"]).dt.normalize()).dt.days
+    return installs.loc[ages >= min_days].copy()

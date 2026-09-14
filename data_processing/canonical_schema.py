@@ -14,9 +14,12 @@ INSTALL_COLUMNS = [
     "platform",
 ]
 
-EVENT_COLUMNS = ["user_key", "event_time", "event_name", "revenue"]
+EVENT_COLUMNS = ["user_key", "event_time", "event_name", "revenue", "revenue_currency"]
 
-COST_COLUMNS = ["date", "media_source", "campaign", "impressions", "clicks", "spend"]
+COST_COLUMNS = [
+    "date", "media_source", "campaign", "adset", "creative",
+    "impressions", "clicks", "spend", "spend_currency",
+]
 
 
 @dataclass
@@ -48,7 +51,30 @@ def coerce_canonical_types(installs: pd.DataFrame, events: pd.DataFrame, cost: p
     cost["clicks"] = pd.to_numeric(cost["clicks"], errors="coerce").fillna(0)
     cost["spend"] = pd.to_numeric(cost["spend"], errors="coerce").fillna(0.0)
 
+    # 빈 값은 추측하지 않는다. 통화가 불명확하면 UI에서 ROAS 판단을 보수적으로 제한한다.
+    events["revenue_currency"] = events["revenue_currency"].fillna("UNKNOWN").astype(str).str.upper()
+    cost["spend_currency"] = cost["spend_currency"].fillna("UNKNOWN").astype(str).str.upper()
+
     return CanonicalDataBundle(installs=installs, events=events, cost=cost)
+
+
+def currency_alignment_status(bundle: CanonicalDataBundle) -> tuple[str, str]:
+    """ROAS 계산에 필요한 매출/비용 통화의 정합성을 반환한다.
+
+    status: aligned | unknown | mismatch | no_cost
+    """
+    if bundle.cost.empty or float(bundle.cost["spend"].sum()) <= 0:
+        return "no_cost", "실제 광고비가 없어 ROAS 기반 판단을 제공하지 않습니다."
+
+    revenue = set(bundle.events.loc[bundle.events["revenue"] != 0, "revenue_currency"].dropna())
+    spend = set(bundle.cost.loc[bundle.cost["spend"] != 0, "spend_currency"].dropna())
+    currencies = revenue | spend
+    if not currencies or "UNKNOWN" in currencies:
+        return "unknown", "매출 또는 비용 통화가 확인되지 않았습니다. ROAS는 참고용으로만 해석하세요."
+    if len(revenue) != 1 or len(spend) != 1 or revenue != spend:
+        return "mismatch", f"매출 통화({', '.join(sorted(revenue))})와 비용 통화({', '.join(sorted(spend))})가 일치하지 않습니다."
+    currency = next(iter(revenue))
+    return "aligned", f"매출·비용이 모두 {currency} 기준으로 정렬되었습니다."
 
 
 

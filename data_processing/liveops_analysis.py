@@ -99,6 +99,73 @@ def compare_liveops_impact_by_level(
     ].sort_values("impact", ascending=False).reset_index(drop=True)
 
 
+def compare_liveops_adjusted(
+    installs: pd.DataFrame,
+    events: pd.DataFrame,
+    event_start: str,
+    event_end: str,
+    level: str = "media_source",
+    baseline_weeks: int = 4,
+    stratify_cols: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """동일 요일의 과거 코호트와 층화 비교를 수행한다.
+
+    이 함수는 인과효과를 확정하지 않는다. 국가·플랫폼·매체 등 관측 가능한
+    믹스를 층화하고 baseline 설치수 가중치로 요약한 '보정 비교 신호'를 만든다.
+    """
+    inst = installs.copy()
+    inst["install_date"] = pd.to_datetime(inst["install_time"]).dt.normalize()
+    start = pd.Timestamp(event_start).normalize()
+    end = pd.Timestamp(event_end).normalize()
+    group_cols = _resolve_group_cols(level)
+    requested_strata = stratify_cols or ["geo", "platform", "media_source"]
+    strata = [c for c in requested_strata if c in inst.columns and c not in group_cols and inst[c].notna().any()]
+    compare_cols = group_cols + strata
+    purchase_events = _purchase_events_only(events)
+
+    event_cohort = inst[inst["install_date"].between(start, end)].copy()
+    event_weekdays = set(pd.date_range(start, end, freq="D").dayofweek.tolist())
+    baseline_end = start - pd.Timedelta(days=1)
+    baseline_start = start - pd.Timedelta(weeks=baseline_weeks)
+    baseline_cohort = inst[
+        inst["install_date"].between(baseline_start, baseline_end)
+        & inst["install_date"].dt.dayofweek.isin(event_weekdays)
+    ].copy()
+
+    event_ltv = _d7_ltv_by_group(event_cohort, purchase_events, compare_cols).rename(
+        columns={"d7_ltv": "event_d7_ltv", "sample": "event_sample"}
+    )
+    baseline_ltv = _d7_ltv_by_group(baseline_cohort, purchase_events, compare_cols).rename(
+        columns={"d7_ltv": "baseline_d7_ltv", "sample": "baseline_sample"}
+    )
+    detail = event_ltv.merge(baseline_ltv, on=compare_cols, how="outer")
+    for col in ["event_d7_ltv", "baseline_d7_ltv", "event_sample", "baseline_sample"]:
+        detail[col] = pd.to_numeric(detail[col], errors="coerce").fillna(0.0)
+    detail["uplift"] = detail["event_d7_ltv"] - detail["baseline_d7_ltv"]
+    detail["uplift_pct"] = (
+        detail["uplift"] / detail["baseline_d7_ltv"].where(detail["baseline_d7_ltv"].abs() > 0)
+    ).fillna(0.0)
+    total_baseline = float(detail["baseline_sample"].sum())
+    detail["baseline_weight"] = detail["baseline_sample"] / total_baseline if total_baseline else 0.0
+    detail["weighted_uplift"] = detail["uplift"] * detail["baseline_weight"]
+    detail["comparison_quality"] = "비교 가능"
+    detail.loc[(detail["event_sample"] == 0) | (detail["baseline_sample"] == 0), "comparison_quality"] = "한쪽 기간 표본 없음"
+
+    summary = pd.DataFrame([{
+        "event_start": start.date(),
+        "event_end": end.date(),
+        "baseline_start": baseline_start.date(),
+        "baseline_end": baseline_end.date(),
+        "baseline_weeks": baseline_weeks,
+        "strata_count": int(len(detail)),
+        "event_sample": int(detail["event_sample"].sum()),
+        "baseline_sample": int(detail["baseline_sample"].sum()),
+        "weighted_d7_ltv_uplift": float(detail["weighted_uplift"].sum()),
+        "comparison_label": "동일 요일·관측 믹스 보정 비교 신호 (인과효과 확정 아님)",
+    }])
+    return detail.sort_values("uplift", ascending=False).reset_index(drop=True), summary
+
+
 def derive_liveops_actions(
     impact_df: pd.DataFrame,
     min_sample: int = 100,

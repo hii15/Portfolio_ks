@@ -1,4 +1,4 @@
 .PHONY: test
 
 test:
-	PYTHONPATH=. pytest -q
+	python -m unittest discover -s tests -v

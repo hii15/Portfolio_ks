@@ -150,28 +150,29 @@ else:
 
 ---
 
-## 6. LiveOps Impact Module
+## 6. LiveOps 전후 비교 모듈
 
 ### 6.1 목적
 
-이벤트/업데이트 기간 신규 유저 가치 상승 효과를 측정합니다.
+이벤트 기간의 신규 유저 가치 변화를 탐지합니다. 통제군이 없을 때 결과는 인과효과가 아닌 **보정된 비교 신호**입니다.
 
 ### 6.2 입력
 
 - 이벤트 시작일
 - 이벤트 종료일
-- 비교 기준 기간 (자동 설정 가능)
+- 동일 요일 기준 과거 비교 주 수
+- 국가·플랫폼·매체 등 관측 가능한 믹스
 
 ### 6.3 계산 방식
 
-- 이벤트 기간 Cohort 생성
-- 이전 기간 Cohort 생성
-- D7 LTV 비교
-- 차이 계산
+- 이벤트 기간 D7 성숙 Cohort 생성
+- 과거 N주 중 동일 요일 Cohort 생성
+- 국가·플랫폼·매체·캠페인 단위 층화 비교
+- baseline 설치수 가중 D7 LTV 변화 계산
 
-`LiveOps Impact = Event Cohort D7 LTV - Pre Cohort D7 LTV`
+`Adjusted comparison signal = Σ(층화 D7 LTV 변화 × baseline 설치수 비중)`
 
-표본 수를 함께 표시합니다.
+통제군(이벤트 미노출 유저/국가/서버)이 없으면 시즌성, 광고비 변화, 업데이트 외 변경 요인을 완전히 분리할 수 없다는 한계를 함께 표시합니다.
 
 ---
 
@@ -229,18 +230,15 @@ project_root/
   - Level 선택(media/campaign/adset/creative)
   - KPI 테이블 + decision reason + efficiency note
   - ROAS gap / install gap 컬럼 제공
-  - Scale Up / Down 표시
+  - 통화 정합성·D7 성숙도·비용 신뢰도 가드레일 표시
+  - 단계적 증액 테스트 / 감액 / 보류 표시
 - Cohort Curve
   - Level 선택 기반 D1~D30 누적 LTV 시각화
   - 세그먼트별 비교
-- LiveOps Impact
+- LiveOps 전후 비교
   - 이벤트 기간 입력
-  - Level 선택 기반 uplift 비교
-  - Cohort 비교 결과
-- Experiment Report
-  - MMP 더미 실험 실행
-  - Insight Cards (Top/Worst/Low Sample)
-  - Summary/Decision/Insight 확인
+  - 동일 요일·층화·가중 보정 비교
+  - 통제군 부재 시 해석 한계 표시
 
 ---
 
@@ -327,18 +325,9 @@ streamlit run app.py
 
 ```bash
 python dummy_data/generate_dummy_data.py
-python dummy_data/run_mmp_experiments.py
 ```
 
 또는 Streamlit Upload 탭에서 **Load MMP Dummy Raw** 버튼으로 바로 더미 로딩이 가능합니다.
-
-생성 결과:
-
-- `dummy_data/experiments/mmp_experiment_summary.csv`
-- `dummy_data/experiments/mmp_decision_table.csv`
-- `dummy_data/experiments/mmp_experiment_report.md`
-
----
 
 ## 16. Test
 
@@ -347,20 +336,14 @@ make test
 ```
 
 
-(동일 명령: `PYTHONPATH=. pytest -q`)
+(동일 명령: `python -m unittest discover -s tests -v`)
 
 
-## 17. CI
-
-GitHub Actions에서 `make test`를 기본 회귀 테스트 명령으로 실행합니다.
-워크플로우 파일: `.github/workflows/ci.yml`
-
-
-## 18. UI 스모크 테스트 체크리스트
+## 17. UI 스모크 테스트 체크리스트
 
 배포 전 최소 시나리오 점검 문서: `UI_E2E_SCENARIOS.md`
 
-## 19. BigQuery 연동 계약 문서
+## 18. BigQuery 연동 계약 문서
 
 Pre-BQ 컬럼/타입/정합성 기준 문서: `docs/BQ_DATA_CONTRACT.md`
 
