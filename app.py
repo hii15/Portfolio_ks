@@ -197,19 +197,38 @@ def _style_decision_table(df: pd.DataFrame):
         for i, col in enumerate(col_names):
             if col == "판단":
                 styles[i] = bg
-            elif col == "목표 대비 ROAS 차이(%)":
-                v = row.get(col, 0)
-                if isinstance(v, (int, float)):
-                    if v >= 15:    styles[i] = "background-color: #c3e6cb; font-weight: bold;"
-                    elif v <= -10: styles[i] = "background-color: #f5c6cb; font-weight: bold;"
-            elif col == "효율 상태":
-                note = str(row.get(col, ""))
-                if "효율 우수" in note:  styles[i] = "color: #155724; font-weight: bold;"
-                elif "효율 저하" in note: styles[i] = "color: #721c24; font-weight: bold;"
+            elif col == "데이터 신뢰도" and "검증 필요" in str(row.get(col, "")):
+                styles[i] = "color: #856404; font-weight: bold;"
         return styles
     return df.style.apply(row_color, axis=1).format(
-        {"목표 대비 ROAS 차이(%)": "{:.1f}%", "최소 설치수 대비 차이": "{:+.0f}"}, na_rep="-"
+        {
+            "설치": "{:,.0f}",
+            "광고비": "₩{:,.0f}",
+            "D7 ROAS": "{:.1%}",
+            "목표 대비": "{:+.1f}%",
+        },
+        na_rep="-",
     )
+
+
+def _segment_label(row: pd.Series, level: str) -> str:
+    """분석 레벨에 맞는 사람이 읽기 쉬운 세그먼트 이름."""
+    level_order = ["media_source", "campaign", "adset", "creative"]
+    visible = level_order[: level_order.index(level) + 1]
+    values = [str(row.get(col, "(미분류)")) for col in visible if col in row.index]
+    return " / ".join(values) if values else "(미분류)"
+
+
+def _data_reliability_label(row: pd.Series) -> str:
+    if not bool(row.get("roas_currency_verified", True)):
+        return "검증 필요 · 통화"
+    if not bool(row.get("cohort_is_mature", True)):
+        return "검증 필요 · D7 미성숙"
+    if bool(row.get("roas_is_estimated", row.get("cost_is_estimated", False))):
+        return "검증 필요 · 추정 비용"
+    if str(row.get("confidence", "")) == "낮음":
+        return "주의 · 표본 부족"
+    return "확인됨"
 
 
 def _show_data_period(canonical) -> None:
@@ -546,8 +565,9 @@ with tab_decision:
             if roas_risk_n:   w1.warning(f"🔴 ROAS 경고: {roas_risk_n}개 세그먼트 (목표 대비 -10% 이하)")
             if sample_risk_n: w2.warning(f"⚠️ 표본 부족: {sample_risk_n}개 세그먼트 (최소 설치수 미달)")
 
-            # 메인 테이블
-            st.markdown("#### 🗂️ 세그먼트별 상세 판단")
+            # 의사결정 중심 테이블: 원천 지표는 선택한 행의 상세 카드로 분리한다.
+            st.markdown("#### 🧭 세그먼트별 예산 의사결정")
+            st.caption("판단·영향·다음 행동을 먼저 확인하세요. 구매·노출 등 원천 지표는 아래 선택 세그먼트 상세에서 제공합니다.")
 
             CONFIDENCE_LABEL_MAP = {
                 "높음": "🟢 높음",
@@ -555,25 +575,65 @@ with tab_decision:
                 "낮음": "🔴 낮음",
             }
 
-            decision_view = decision_df.copy()
-            decision_view["decision"]        = decision_view["decision"].map(DECISION_LABEL_MAP).fillna(decision_view["decision"])
-            decision_view["decision_reason"] = decision_view["decision_reason"]  # 이미 rich reason
-            decision_view["efficiency_note"] = decision_view["efficiency_note"].apply(lambda x: EFFICIENCY_NOTE_MAP.get(str(x), str(x)))
-            decision_view["confidence"]      = decision_view["confidence"].map(CONFIDENCE_LABEL_MAP).fillna(decision_view["confidence"])
-            decision_view = decision_view.rename(columns={
-                "decision":               "판단",
-                "decision_reason":        "판단 사유",
-                "action":                 "권장 액션",
-                "confidence":             "신뢰도",
-                "confidence_note":        "신뢰도 근거",
-                "efficiency_note":        "효율 상태",
-                "roas_gap_vs_target_pct": "목표 대비 ROAS 차이(%)",
-                "install_gap_to_min":     "최소 설치수 대비 차이",
-            })
-            st.dataframe(_style_decision_table(decision_view), use_container_width=True, height=420)
+            decision_detail = decision_df.copy().reset_index(drop=True)
+            decision_detail["세그먼트"] = decision_detail.apply(lambda row: _segment_label(row, decision_level), axis=1)
+            decision_detail["데이터 신뢰도"] = decision_detail.apply(_data_reliability_label, axis=1)
+            decision_detail["판단"] = decision_detail["decision"].map(DECISION_LABEL_MAP).fillna(decision_detail["decision"])
+            decision_detail["신뢰도"] = decision_detail["confidence"].map(CONFIDENCE_LABEL_MAP).fillna(decision_detail["confidence"])
+            decision_detail["목표 대비"] = decision_detail["roas_gap_vs_target_pct"]
+
+            decision_view = decision_detail.rename(columns={
+                "installs": "설치",
+                "spend": "광고비",
+                "d7_roas": "D7 ROAS",
+                "action": "다음 행동",
+            })[["판단", "세그먼트", "설치", "광고비", "D7 ROAS", "목표 대비", "데이터 신뢰도", "다음 행동"]]
+            st.dataframe(_style_decision_table(decision_view), use_container_width=True, height=380, hide_index=True)
             st.download_button("📥 판단 결과 CSV", data=_to_csv_bytes(decision_view),
                                file_name="ua_decision_table.csv", mime="text/csv",
                                use_container_width=True, key="dl_decision")
+
+            st.markdown("##### 선택 세그먼트 상세")
+            if decision_detail.empty:
+                st.info("선택한 분석 레벨에 비교 가능한 세그먼트가 없습니다. 매체 또는 캠페인 레벨로 바꿔 확인해 주세요.")
+            else:
+                selected_segment = st.selectbox(
+                    "판단 근거와 세부 지표를 볼 세그먼트",
+                    options=decision_detail.index.tolist(),
+                    format_func=lambda idx: decision_detail.at[idx, "세그먼트"],
+                    key="decision_segment_detail",
+                )
+                selected = decision_detail.loc[selected_segment]
+                dc1, dc2, dc3, dc4 = st.columns(4)
+                dc1.metric("D7 ROAS", f"{selected['d7_roas']:.1%}")
+                dc2.metric("목표 대비", f"{selected['roas_gap_vs_target_pct']:+.1f}%")
+                dc3.metric("CPI", f"₩{selected['cpi']:,.0f}")
+                dc4.metric("D7 LTV", f"₩{selected['d7_ltv']:,.0f}")
+                st.info(f"**판단 근거**  {selected['decision_reason']}")
+                st.success(f"**다음 행동**  {selected['action']}")
+
+                with st.expander("성장 · 품질 · 데이터 신뢰도 상세", expanded=False):
+                    detail_columns = [
+                        "세그먼트", "installs", "spend", "impressions", "clicks", "purchasers",
+                        "purchase_rate", "d1_roas", "d7_roas", "d1_ltv", "d7_ltv", "arpu", "arppu",
+                        "confidence_note", "데이터 신뢰도",
+                    ]
+                    available_detail_columns = [c for c in detail_columns if c in decision_detail.columns]
+                    detail_view = decision_detail.loc[[selected_segment], available_detail_columns].rename(columns={
+                        "installs": "설치", "spend": "광고비", "impressions": "노출", "clicks": "클릭",
+                        "purchasers": "구매자", "purchase_rate": "구매율", "d1_roas": "D1 ROAS",
+                        "d7_roas": "D7 ROAS", "d1_ltv": "D1 LTV", "d7_ltv": "D7 LTV",
+                        "arpu": "ARPU", "arppu": "ARPPU", "confidence_note": "표본 근거",
+                    })
+                    st.dataframe(
+                        detail_view.style.format({
+                            "설치": "{:,.0f}", "광고비": "₩{:,.0f}", "노출": "{:,.0f}", "클릭": "{:,.0f}",
+                            "구매자": "{:,.0f}", "구매율": "{:.1%}", "D1 ROAS": "{:.1%}", "D7 ROAS": "{:.1%}",
+                            "D1 LTV": "₩{:,.0f}", "D7 LTV": "₩{:,.0f}", "ARPU": "₩{:,.0f}", "ARPPU": "₩{:,.0f}",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
             # ── [NEW] 신뢰도 분포 요약 ──
             st.markdown("#### 🎯 신뢰도 분포")
