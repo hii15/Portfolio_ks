@@ -21,11 +21,20 @@ def _recommend_action(decision: str, row: pd.Series, target_roas: float) -> str:
     if decision == "Hold (Low Sample)":
         return "예산 유지 후 표본 확보 대기 (최소 설치수 충족 시 재판단)"
 
+    if decision == "Hold (Estimated Cost)":
+        return "실제 소재/광고그룹 비용을 연결한 뒤 재판단"
+
+    if decision == "Hold (Unverified Currency)":
+        return "매출·비용 통화를 같은 기준으로 정렬한 뒤 재판단"
+
+    if decision == "Hold (Immature Cohort)":
+        return "D7 성숙 코호트가 쌓인 뒤 재판단"
+
     if decision == "Scale Up":
         roas_gap = (d7_roas - target_roas) / target_roas
         if roas_gap >= 0.5:
-            return "예산 +30~50% 증액 · 소재 물량 확대 · 입찰가 +10% 검토"
-        return "예산 +15~25% 증액 · 현 소재 유지 · 주간 단위 모니터링"
+            return "예산 +15% 증액 테스트 · 7일 후 재평가 · 소재 물량 확대 검토"
+        return "예산 +10% 증액 테스트 · 현 소재 유지 · 7일 후 재평가"
 
     if decision == "Scale Down":
         # 원인 분해: CPI 문제 vs LTV 문제
@@ -73,6 +82,15 @@ def _rich_reason(decision: str, row: pd.Series, target_roas: float,
     if decision == "Hold (Low Sample)":
         return f"설치수 {installs:,}명으로 최소 기준({min_installs:,}명) 미달 — 데이터 누적 후 재판단 필요"
 
+    if decision == "Hold (Estimated Cost)":
+        return "하위 레벨 광고비가 설치수 비율로 추정되었습니다 — 실제 비용 연결 전에는 자동 집행 판단을 보류합니다"
+
+    if decision == "Hold (Unverified Currency)":
+        return "매출과 광고비 통화가 확인되었거나 일치하지 않습니다 — 환산 기준 확정 전에는 자동 집행 판단을 보류합니다"
+
+    if decision == "Hold (Immature Cohort)":
+        return "D7 성숙 코호트가 없어 현재 ROAS는 자동 집행 판단에 사용하지 않습니다"
+
     if decision == "Scale Up":
         gap = (d7_roas - target_roas) / target_roas * 100
         return (f"D7 ROAS {d7_roas:.3f}로 목표({target_roas:.1f}) 대비 +{gap:.1f}% 초과 달성 · "
@@ -112,8 +130,17 @@ def apply_decision_logic(
         purchasers = int(row.get("purchasers", 0))
         d7_roas    = float(row.get("d7_roas",  0.0))
 
-        # ── 판단 ──
-        if installs < min_installs:
+        # 비용이 추정된 하위 레벨은 ROAS로 자동 집행 판단을 하지 않는다.
+        is_currency_verified = bool(row.get("roas_currency_verified", True))
+        is_cohort_mature = bool(row.get("cohort_is_mature", True))
+        is_estimated_cost = bool(row.get("roas_is_estimated", row.get("cost_is_estimated", False)))
+        if not is_currency_verified:
+            decision = "Hold (Unverified Currency)"
+        elif not is_cohort_mature:
+            decision = "Hold (Immature Cohort)"
+        elif is_estimated_cost:
+            decision = "Hold (Estimated Cost)"
+        elif installs < min_installs:
             decision = "Hold (Low Sample)"
         elif d7_roas > upper:
             decision = "Scale Up"
@@ -146,6 +173,12 @@ def apply_decision_logic(
     out["install_gap_to_min"] = out.get("installs", 0) - min_installs
 
     def _efficiency_note(row: pd.Series) -> str:
+        if not bool(row.get("roas_currency_verified", True)):
+            return "Currency unverified"
+        if not bool(row.get("cohort_is_mature", True)):
+            return "Cohort immature"
+        if bool(row.get("roas_is_estimated", row.get("cost_is_estimated", False))):
+            return "Estimated cost"
         if int(row.get("installs", 0)) < min_installs:
             return "Sample risk"
         if float(row.get("d7_roas", 0.0)) >= upper:

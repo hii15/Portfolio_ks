@@ -8,12 +8,18 @@ from data_processing.loader import load_file
 from data_processing.adapters import ADAPTER_REGISTRY
 from data_processing.canonical_schema import (
     coerce_canonical_types,
+    currency_alignment_status,
     format_validation_issues,
     validate_canonical_bundle_detailed,
 )
-from data_processing.metrics_engine import calculate_media_metrics, calculate_cohort_curve, decompose_roas_change, check_cohort_maturity
+from data_processing.metrics_engine import (
+    calculate_media_metrics, calculate_cohort_curve, decompose_roas_change,
+    check_cohort_maturity, filter_mature_cohorts,
+)
 from data_processing.decision_engine import apply_decision_logic
-from data_processing.liveops_analysis import compare_liveops_impact_by_level, derive_liveops_actions
+from data_processing.liveops_analysis import (
+    compare_liveops_impact_by_level, compare_liveops_adjusted, derive_liveops_actions,
+)
 from data_processing.raw_templates import get_raw_template_bundle
 from dummy_data.generate_dummy_data import get_mmp_raw_bundle
 
@@ -40,6 +46,9 @@ DECISION_LABEL_MAP = {
     "Scale Up":          "⬆️ 증액",
     "Scale Down":        "⬇️ 감액",
     "Hold (Low Sample)": "⏸️ 보류(표본 부족)",
+    "Hold (Estimated Cost)": "⏸️ 보류(추정 비용)",
+    "Hold (Unverified Currency)": "⏸️ 보류(통화 미확인)",
+    "Hold (Immature Cohort)": "⏸️ 보류(D7 미성숙)",
     "Maintain":          "✅ 유지",
 }
 EFFICIENCY_NOTE_MAP = {
@@ -47,6 +56,9 @@ EFFICIENCY_NOTE_MAP = {
     "Strong efficiency": "🟢 효율 우수",
     "Efficiency risk":   "🔴 효율 저하",
     "Near target":       "🟡 목표 근접",
+    "Estimated cost":    "⚪ 추정 비용",
+    "Currency unverified": "⚪ 통화 미확인",
+    "Cohort immature":   "⚪ D7 미성숙",
 }
 # (seed, label, phase)
 # phase: "launch" = 사전예약~런칭기 (7~10억/월), "sustain" = 유지기 (1.5~3억/월)
@@ -108,8 +120,8 @@ def _normalize_uploaded_data(mmp, installs_raw, events_raw, cost_raw):
     events    = adapter.normalize_events(events_raw)
     cost      = adapter.normalize_cost(cost_raw) if cost_raw is not None else pd.DataFrame()
     canonical = coerce_canonical_types(installs=installs, events=events, cost=cost)
-    if canonical.cost.empty or canonical.cost["spend"].sum() == 0:
-        canonical.cost = _empty_cost_template(canonical.installs)
+    # 비용이 없을 때 임의 CPI로 비용을 만들면 실제 ROAS처럼 보일 위험이 있다.
+    # 빈 비용은 그대로 유지하고 UI에서 ROAS 기반 판단을 제한한다.
     issues = validate_canonical_bundle_detailed(canonical)
     if issues:
         raise ValueError(format_validation_issues(issues))
@@ -211,6 +223,17 @@ def _show_data_period(canonical) -> None:
         st.caption(f"📅 데이터 기간: **{min_d} ~ {max_d}** · 총 설치수: **{total_installs:,}명**")
     except Exception:
         pass
+
+
+def _data_reference_date(canonical) -> pd.Timestamp | None:
+    """코호트 성숙도 판단에 사용할 데이터 관측 기준일."""
+    candidates = []
+    for df, col in [(canonical.installs, "install_time"), (canonical.events, "event_time"), (canonical.cost, "date")]:
+        if not df.empty and col in df.columns:
+            values = pd.to_datetime(df[col], errors="coerce").dropna()
+            if not values.empty:
+                candidates.append(values.max())
+    return max(candidates) if candidates else None
 
 
 # ─────────────────────────────────────────────
@@ -436,7 +459,15 @@ with tab_decision:
     if canonical is None:
         st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
     else:
-        st.caption("D7 ROAS = 설치 후 7일 누적 매출 ÷ 광고비 | Payback = 광고비 ÷ (D7매출 / 7일)")
+        currency_status, currency_message = currency_alignment_status(canonical)
+        if currency_status == "aligned":
+            st.success(f"✅ {currency_message}")
+        elif currency_status == "mismatch":
+            st.error(f"⛔ {currency_message} 환산 기준을 정한 뒤 ROAS 판단을 사용하세요.")
+        else:
+            st.warning(f"⚠️ {currency_message}")
+
+        st.caption("D7 ROAS = 설치 후 7일 누적 매출 ÷ 같은 기간 광고비 · 자동 판단은 통화가 정렬된 실제 비용에서만 권장됩니다.")
 
         with st.expander("📖 용어 설명", expanded=False):
             st.markdown("""
@@ -450,7 +481,7 @@ with tab_decision:
 
         p1, p2, p3 = st.columns(3)
         decision_level = p1.selectbox("분석 레벨", ANALYSIS_LEVEL_OPTIONS, index=1, format_func=lambda x: ANALYSIS_LEVEL_LABELS[x], key="decision_level")
-        target_roas    = p2.number_input("목표 ROAS", min_value=0.0, value=1.0, step=0.05, key="decision_target_roas")
+        target_roas    = p2.number_input("목표 ROAS", min_value=0.01, value=1.0, step=0.05, key="decision_target_roas")
         min_installs   = p3.number_input("최소 설치수 기준", min_value=1, value=200, step=10, key="decision_min_installs")
 
         # Geo 필터
@@ -466,9 +497,19 @@ with tab_decision:
         if period_installs.empty:
             st.warning("선택한 기간에 데이터가 없습니다. 기간을 넓혀 주세요.")
         else:
-            metrics     = calculate_media_metrics(period_installs, canonical.events, canonical.cost, level=decision_level)
+            reference_date = _data_reference_date(canonical)
+            mature_installs = filter_mature_cohorts(period_installs, reference_date=reference_date, min_days=7)
+            excluded_n = len(period_installs) - len(mature_installs)
+            if excluded_n:
+                st.info(f"🕐 D7 미성숙 코호트 {excluded_n:,}명을 자동 판단에서 제외했습니다. 기준일: {pd.Timestamp(reference_date).date()}")
+            if mature_installs.empty:
+                st.warning("D7 성숙 코호트가 없습니다. 분석 종료일로부터 최소 7일이 지난 뒤 다시 확인해 주세요.")
+            metrics_source = mature_installs if not mature_installs.empty else period_installs
+            metrics = calculate_media_metrics(metrics_source, canonical.events, canonical.cost, level=decision_level)
+            metrics["cohort_is_mature"] = not mature_installs.empty
+            metrics["roas_currency_verified"] = currency_status == "aligned"
             decision_df = apply_decision_logic(metrics, target_roas=target_roas, min_installs=int(min_installs))
-            rank_map    = {"Scale Down": 0, "Hold (Low Sample)": 1, "Maintain": 2, "Scale Up": 3}
+            rank_map    = {"Scale Down": 0, "Hold (Low Sample)": 1, "Hold (Estimated Cost)": 1, "Hold (Unverified Currency)": 1, "Hold (Immature Cohort)": 1, "Maintain": 2, "Scale Up": 3}
             decision_df = (
                 decision_df
                 .assign(_rank=decision_df["decision"].map(rank_map).fillna(99))
@@ -544,7 +585,7 @@ with tab_decision:
 
             # ── [NEW] 코호트 성숙도 가드레일 ──
             st.markdown("#### 🕐 코호트 성숙도 체크 (Attribution Lag 가드레일)")
-            maturity = check_cohort_maturity(period_installs, min_days=7)
+            maturity = check_cohort_maturity(period_installs, reference_date=reference_date, min_days=7)
             immature_n   = maturity.attrs.get("immature_installs", 0)
             immature_pct = maturity.attrs.get("immature_pct", 0.0)
             total_n      = maturity.attrs.get("total_installs", 0)
@@ -553,7 +594,7 @@ with tab_decision:
             if immature_pct > 20:
                 st.warning(
                     f"⚠️ **D7 미성숙 코호트 비중 {immature_pct:.1f}%** ({immature_n:,}명 / 전체 {total_n:,}명) — "
-                    f"설치 후 7일이 지나지 않은 유저가 포함되어 D7 ROAS가 **과소 추정**되었을 수 있습니다. "
+                    f"설치 후 7일이 지나지 않은 유저는 자동 판단에서 제외했습니다. "
                     f"기준일: {ref_date}"
                 )
             elif immature_pct > 0:
@@ -562,7 +603,7 @@ with tab_decision:
                     f"비중이 낮아 판단에 미치는 영향은 제한적입니다."
                 )
             else:
-                st.success("✅ 모든 코호트가 D7 기준을 충족했습니다. ROAS 수치를 신뢰할 수 있습니다.")
+                st.success("✅ 선택된 코호트가 모두 D7 기준을 충족합니다.")
 
             with st.expander("날짜별 코호트 성숙도 상세", expanded=False):
                 maturity_view = maturity.rename(columns={
@@ -595,7 +636,8 @@ with tab_decision:
                     st.info("직전 기간 데이터가 부족해 ROAS 분해를 건너뜁니다. 분석 기간을 더 짧게 설정하면 비교가 가능해집니다.")
                 else:
                     _grp = [c for c in ["media_source", "campaign"] if c in metrics.columns][:1]
-                    _m_prev = calculate_media_metrics(_prev_installs, canonical.events, canonical.cost, level=decision_level)
+                    _prev_mature = filter_mature_cohorts(_prev_installs, reference_date=reference_date, min_days=7)
+                    _m_prev = calculate_media_metrics(_prev_mature, canonical.events, canonical.cost, level=decision_level)
                     decomp   = decompose_roas_change(metrics, _m_prev, group_cols=_grp)
 
                     if decomp.empty:
@@ -779,13 +821,17 @@ with tab_curve:
 # 탭 5 : 라이브옵스 영향
 # ══════════════════════════════════════════════
 with tab_liveops:
-    st.subheader("라이브옵스 영향")
+    st.subheader("라이브옵스 전후 비교")
     _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
         st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
     else:
-        st.caption("라이브옵스 영향 = 이벤트 기간 D7 LTV − 비교 기간 D7 LTV")
+        st.caption("동일 요일의 과거 코호트와 국가·플랫폼·매체 믹스를 맞춘 D7 LTV 비교입니다. 인과효과를 확정하지 않습니다.")
+        st.warning(
+            "⚠️ 통제군(이벤트 미노출 유저·국가·서버) 정보가 없으면 이 결과는 '보정된 비교 신호'입니다. "
+            "광고비, 시즌성, 업데이트 외 변경 요인의 순수 효과를 분리할 수 없습니다."
+        )
 
         st.info(
             f"💡 더미 데이터 라이브옵스 이벤트 기간: "
@@ -802,21 +848,23 @@ with tab_liveops:
         col1, col2, col3, col4 = st.columns(4)
         lo_start      = col1.date_input("이벤트 시작일", value=default_start, key="liveops_start")
         lo_end        = col2.date_input("이벤트 종료일", value=default_end, key="liveops_end")
-        baseline_days = col3.number_input("비교 기간(일)", min_value=1, value=7, step=1, key="liveops_baseline")
+        baseline_weeks = col3.number_input("동일 요일 기준 과거 주 수", min_value=1, value=4, step=1, key="liveops_baseline_weeks")
         liveops_level = col4.selectbox("분석 레벨", ANALYSIS_LEVEL_OPTIONS, index=0, format_func=lambda x: ANALYSIS_LEVEL_LABELS[x], key="liveops_level")
         min_sample    = st.number_input("최소 표본수 필터", min_value=0, value=100, step=10, key="liveops_min_sample")
 
         if lo_start > lo_end:
             st.error("시작일은 종료일보다 늦을 수 없습니다.")
         else:
-            impact_df = compare_liveops_impact_by_level(
-                canonical.installs, canonical.events,
+            reference_date = _data_reference_date(canonical)
+            mature_installs = filter_mature_cohorts(canonical.installs, reference_date=reference_date, min_days=7)
+            detail_df, summary_df = compare_liveops_adjusted(
+                mature_installs, canonical.events,
                 event_start=str(lo_start), event_end=str(lo_end),
-                baseline_days=int(baseline_days), level=liveops_level,
+                baseline_weeks=int(baseline_weeks), level=liveops_level,
             )
-            filtered = impact_df[
-                (impact_df["liveops_sample"] >= int(min_sample)) |
-                (impact_df["baseline_sample"] >= int(min_sample))
+            filtered = detail_df[
+                (detail_df["event_sample"] >= int(min_sample))
+                & (detail_df["baseline_sample"] >= int(min_sample))
             ].copy()
 
             if filtered.empty:
@@ -824,37 +872,38 @@ with tab_liveops:
                 st.markdown(f"""
 **해결 방법**
 1. 이벤트 기간을 더 넓혀 보세요 (현재 `{lo_start}` ~ `{lo_end}`)
-2. 분석 레벨을 더 상위(매체/캠페인)로 바꿔 보세요
-3. 최소 표본수 필터(`{int(min_sample)}`)를 낮춰 보세요
-4. 더미 데이터라면 위 '권장 날짜 자동 입력' 버튼을 눌러 주세요
+2. 동일 요일 기준 과거 주 수를 늘려 보세요
+3. 분석 레벨을 더 상위(매체/캠페인)로 바꿔 보세요
+4. 최소 표본수 필터(`{int(min_sample)}`)를 낮춰 보세요
+5. 더미 데이터라면 위 '권장 날짜 자동 입력' 버튼을 눌러 주세요
 """)
             else:
-                top_seg    = filtered.nlargest(1, "impact").iloc[0]
-                bottom_seg = filtered.nsmallest(1, "impact").iloc[0]
+                segment_cols = [c for c in ["media_source", "campaign", "adset", "creative", "geo", "platform"] if c in filtered.columns]
+                filtered["비교 세그먼트"] = filtered[segment_cols].fillna("(없음)").astype(str).agg(" | ".join, axis=1)
+                top_seg    = filtered.nlargest(1, "uplift").iloc[0]
+                bottom_seg = filtered.nsmallest(1, "uplift").iloc[0]
+                summary = summary_df.iloc[0]
 
                 lv1, lv2, lv3, lv4 = st.columns(4)
-                lv1.metric("평균 D7 LTV 상승",    f"{filtered['impact'].mean():.4f}")
-                lv2.metric("최대 상승 세그먼트",   top_seg["segment"],    delta=f"ΔLTV {top_seg['impact']:.2f}")
-                lv3.metric("최소 상승 세그먼트",   bottom_seg["segment"], delta=f"ΔLTV {bottom_seg['impact']:.2f}", delta_color="inverse")
-                lv4.metric("비교 세그먼트 수",     len(filtered))
+                lv1.metric("가중 D7 LTV 변화", f"{summary['weighted_d7_ltv_uplift']:.4f}", help="baseline 설치수 비중으로 가중한 변화입니다.")
+                lv2.metric("최대 상승 세그먼트", top_seg["비교 세그먼트"], delta=f"ΔLTV {top_seg['uplift']:.2f}")
+                lv3.metric("최대 하락 세그먼트", bottom_seg["비교 세그먼트"], delta=f"ΔLTV {bottom_seg['uplift']:.2f}", delta_color="inverse")
+                lv4.metric("비교 가능 세그먼트", len(filtered))
 
-                st.markdown("#### 매체별 라이브옵스 영향 요약")
-                cards = filtered.groupby("media_source", as_index=False).agg(
-                    평균_ΔLTV =("impact",        "mean"),
-                    세그먼트수 =("segment",       "count"),
-                    총_표본   =("liveops_sample", "sum"),
-                ).sort_values("평균_ΔLTV", ascending=False)
-                st.dataframe(cards, use_container_width=True)
-
-                actionable    = derive_liveops_actions(filtered, min_sample=int(min_sample))
-                action_counts = actionable["action_label"].value_counts().to_dict()
-                a1, a2, a3 = st.columns(3)
-                a1.metric("⬆️ 증액 후보",      int(action_counts.get("증액 후보", 0)))
-                a2.metric("🔻 점검/감액 후보",  int(action_counts.get("점검/감액 후보", 0)))
-                a3.metric("⏸️ 보류(표본 부족)", int(action_counts.get("보류(표본 부족)", 0)))
-
-                st.markdown("#### 레벨별 라이브옵스 영향 + 운영 액션")
-                st.dataframe(actionable, use_container_width=True)
-                st.download_button("📥 라이브옵스 결과 CSV", data=_to_csv_bytes(actionable),
-                                   file_name="liveops_impact.csv", mime="text/csv",
+                st.info(
+                    f"비교 기준: 이벤트 기간 {summary['event_start']}~{summary['event_end']} · "
+                    f"과거 {int(summary['baseline_weeks'])}주 중 동일 요일 · "
+                    f"이벤트 표본 {int(summary['event_sample']):,}명 / 기준 표본 {int(summary['baseline_sample']):,}명"
+                )
+                st.markdown("#### 층화·가중 보정 상세")
+                display_cols = [*segment_cols, "event_d7_ltv", "baseline_d7_ltv", "uplift", "uplift_pct", "event_sample", "baseline_sample", "comparison_quality"]
+                display_df = filtered[display_cols].rename(columns={
+                    "event_d7_ltv": "이벤트 기간 D7 LTV", "baseline_d7_ltv": "기준 기간 D7 LTV",
+                    "uplift": "D7 LTV 변화", "uplift_pct": "변화율", "event_sample": "이벤트 표본",
+                    "baseline_sample": "기준 표본", "comparison_quality": "비교 상태",
+                })
+                st.dataframe(display_df.style.format({"D7 LTV 변화": "{:+.4f}", "변화율": "{:+.1%}"}), use_container_width=True)
+                st.caption("국가·플랫폼·매체 등 관측 가능한 믹스만 보정합니다. 통제군 또는 무작위 홀드아웃이 없으면 순수한 LiveOps 인과효과는 산출하지 않습니다.")
+                st.download_button("📥 보정 비교 결과 CSV", data=_to_csv_bytes(filtered),
+                                   file_name="liveops_adjusted_comparison.csv", mime="text/csv",
                                    use_container_width=True, key="dl_liveops")

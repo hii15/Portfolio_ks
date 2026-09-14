@@ -4,12 +4,13 @@ import pandas as pd
 from data_processing.adapters import AppsFlyerAdapter
 from data_processing.canonical_schema import (
     coerce_canonical_types,
+    currency_alignment_status,
     format_validation_issues,
     validate_canonical_bundle,
     validate_canonical_bundle_detailed,
 )
 from data_processing.metrics_engine import calculate_media_metrics, calculate_cohort_curve
-from data_processing.liveops_analysis import compare_liveops_impact, compare_liveops_impact_by_level, derive_liveops_actions
+from data_processing.liveops_analysis import compare_liveops_impact, compare_liveops_impact_by_level, compare_liveops_adjusted, derive_liveops_actions
 from data_processing.decision_engine import apply_decision_logic
 
 
@@ -305,6 +306,59 @@ class NewEngineModulesTests(unittest.TestCase):
         self.assertTrue(any(item["code"] == "E002" for item in detailed))
         self.assertIn("해결:", rendered)
         self.assertIn("[E002]", rendered)
+
+    def test_metrics_only_use_cost_from_selected_install_period(self):
+        installs = pd.DataFrame({
+            "user_key": ["u1", "u2"],
+            "install_time": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+            "media_source": ["Meta", "Meta"], "campaign": ["C1", "C1"],
+        })
+        events = pd.DataFrame({
+            "user_key": ["u1"], "event_time": pd.to_datetime(["2026-01-02"]),
+            "event_name": ["purchase"], "revenue": [100.0],
+        })
+        cost = pd.DataFrame({
+            "date": ["2026-01-01", "2026-01-02"], "media_source": ["Meta", "Meta"],
+            "campaign": ["C1", "C1"], "impressions": [1, 1], "clicks": [1, 1], "spend": [100.0, 900.0],
+        })
+        out = calculate_media_metrics(installs.iloc[[0]], events, cost, level="campaign")
+        self.assertEqual(float(out.loc[0, "spend"]), 100.0)
+        self.assertEqual(float(out.loc[0, "cpi"]), 100.0)
+
+    def test_creative_cost_is_flagged_when_only_campaign_cost_exists(self):
+        installs = pd.DataFrame({
+            "user_key": ["u1", "u2"], "install_time": pd.to_datetime(["2026-01-01"] * 2),
+            "media_source": ["Meta", "Meta"], "campaign": ["C1", "C1"],
+            "adset": ["A1", "A1"], "creative": ["CR1", "CR2"],
+        })
+        events = pd.DataFrame(columns=["user_key", "event_time", "event_name", "revenue"])
+        cost = pd.DataFrame({"date": ["2026-01-01"], "media_source": ["Meta"], "campaign": ["C1"], "impressions": [1], "clicks": [1], "spend": [100.0]})
+        out = calculate_media_metrics(installs, events, cost, level="creative")
+        self.assertTrue(out["roas_is_estimated"].all())
+
+    def test_currency_mismatch_is_detected(self):
+        installs = pd.DataFrame({"user_key": ["u1"], "install_time": ["2026-01-01"], "media_source": ["Meta"], "campaign": ["C1"]})
+        events = pd.DataFrame({"user_key": ["u1"], "event_time": ["2026-01-02"], "event_name": ["purchase"], "revenue": [10], "revenue_currency": ["USD"]})
+        cost = pd.DataFrame({"date": ["2026-01-01"], "media_source": ["Meta"], "campaign": ["C1"], "impressions": [1], "clicks": [1], "spend": [10000], "spend_currency": ["KRW"]})
+        status, _ = currency_alignment_status(coerce_canonical_types(installs, events, cost))
+        self.assertEqual(status, "mismatch")
+
+    def test_adjusted_liveops_uses_weekday_matched_baseline_and_returns_summary(self):
+        installs = pd.DataFrame({
+            "user_key": ["u1", "u2", "u3", "u4"],
+            "install_time": pd.to_datetime(["2026-01-19", "2026-01-12", "2026-01-05", "2025-12-29"]),
+            "media_source": ["Meta"] * 4, "campaign": ["C1"] * 4,
+            "geo": ["KR"] * 4, "platform": ["Android"] * 4,
+        })
+        events = pd.DataFrame({
+            "user_key": ["u1", "u2", "u3", "u4"],
+            "event_time": pd.to_datetime(["2026-01-20", "2026-01-13", "2026-01-06", "2025-12-30"]),
+            "event_name": ["purchase"] * 4, "revenue": [20.0, 10.0, 10.0, 10.0],
+        })
+        detail, summary = compare_liveops_adjusted(installs, events, "2026-01-19", "2026-01-19", baseline_weeks=3)
+        self.assertFalse(detail.empty)
+        self.assertIn("weighted_d7_ltv_uplift", summary.columns)
+        self.assertEqual(int(summary.loc[0, "baseline_weeks"]), 3)
 
 
 if __name__ == "__main__":

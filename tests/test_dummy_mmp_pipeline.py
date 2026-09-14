@@ -43,15 +43,15 @@ class DummyMMPPipelineTests(unittest.TestCase):
     def test_dummy_seed_snapshot_is_deterministic(self):
         installs, events, cost = generate_canonical_dummy_data(seed=11)
 
-        self.assertEqual(len(installs), 105497)
-        self.assertEqual(len(events), 13481)
+        self.assertEqual(len(installs), 157578)
+        self.assertEqual(len(events), 21927)
         self.assertEqual(len(cost), 480)
 
         installs_by_media = installs.groupby("media_source")["user_key"].nunique().to_dict()
-        self.assertEqual(installs_by_media["Naver"], 13599)
-        self.assertEqual(installs_by_media["Meta"], 13058)
+        self.assertEqual(installs_by_media["Naver"], 17601)
+        self.assertEqual(installs_by_media["Meta"], 22462)
 
-        self.assertAlmostEqual(float(cost["spend"].sum()), 494312296.17, places=2)
+        self.assertAlmostEqual(float(cost["spend"].sum()), 730498557.46, places=2)
 
     def test_dummy_currency_is_krw_scale(self):
         appsflyer_installs, appsflyer_events, appsflyer_cost = get_mmp_raw_bundle(mmp="AppsFlyer", seed=13)

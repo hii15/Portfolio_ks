@@ -259,6 +259,7 @@ def generate_canonical_dummy_data(seed: int = 42, phase: str = "launch"):
                                 "event_time": day + pd.Timedelta(days=lag, hours=int(rng.integers(0, 24))),
                                 "event_name": "af_purchase",
                                 "revenue":    round(float(rev_per_purchase * rng.uniform(0.75, 1.25)), 2),
+                                "revenue_currency": "KRW",
                             })
 
                 if campaign_user_keys:
@@ -276,6 +277,7 @@ def generate_canonical_dummy_data(seed: int = 42, phase: str = "launch"):
                             * float(rng.normal(loc=1.0, scale=0.08))  # 비용은 작은 변동성
                             , 2
                         ),
+                        "spend_currency": "KRW",
                     })
 
     return pd.DataFrame(installs_rows), pd.DataFrame(events_rows), pd.DataFrame(cost_rows)
