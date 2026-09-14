@@ -29,7 +29,14 @@ from dummy_data.generate_dummy_data import get_mmp_raw_bundle
 # ─────────────────────────────────────────────
 st.set_page_config(layout="wide", page_title="게임 UA 의사결정 콘솔")
 st.title("🎮 게임 UA 의사결정 콘솔")
-st.caption("MMP 원본 데이터를 기반으로 UA 집행 판단 · 예산 배분 · Cohort LTV · LiveOps 영향을 분석하는 인하우스 의사결정 도구")
+st.caption("오늘의 UA 집행 판단부터 예산 조정 근거 분석까지 연결하는 인하우스 운영 콘솔")
+st.markdown("""
+<style>
+    .stTabs [data-baseweb="tab-list"] { gap: 1.2rem; }
+    .stTabs [data-baseweb="tab"] { font-size: 1rem; font-weight: 600; padding: 0.75rem 0.2rem; }
+    [data-testid="stMetric"] { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 0.65rem; padding: 0.8rem; }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
@@ -255,6 +262,69 @@ def _data_reference_date(canonical) -> pd.Timestamp | None:
     return max(candidates) if candidates else None
 
 
+def _render_data_status(canonical) -> None:
+    """모든 업무 영역에서 같은 기준으로 보여주는 데이터 신뢰 상태."""
+    if canonical is None:
+        st.info("데이터 상태: 아직 데이터가 없습니다. `데이터 관리`에서 더미 시나리오 또는 MMP 원본을 불러와 주세요.")
+        return
+
+    currency_status, currency_message = currency_alignment_status(canonical)
+    reference_date = _data_reference_date(canonical)
+    total_installs = len(canonical.installs)
+    mature_installs = filter_mature_cohorts(canonical.installs, reference_date=reference_date, min_days=7)
+    mature_pct = len(mature_installs) / total_installs * 100 if total_installs else 0.0
+    latest_date = pd.to_datetime(canonical.installs["install_time"], errors="coerce").max()
+    status_label = {"aligned": "통화 확인됨", "mismatch": "통화 불일치", "unknown": "통화 확인 필요"}.get(currency_status, "통화 확인 필요")
+    st.caption(
+        f"데이터 상태  ·  최신 설치 {latest_date:%Y-%m-%d}  ·  D7 성숙 {mature_pct:.0f}%  ·  "
+        f"{status_label}  ·  {currency_message}"
+    )
+
+
+def _render_operations_overview(canonical) -> None:
+    """매일 운영자가 가장 먼저 보는 예산 조정 요약."""
+    st.header("오늘의 UA 운영 현황")
+    st.caption("자동 판단은 D7 성숙 코호트와 통화가 확인된 광고비만 사용합니다.")
+    if canonical is None:
+        st.info("먼저 `데이터 관리`에서 데이터를 불러오면 오늘의 우선 조정 대상을 보여드립니다.")
+        return
+
+    currency_status, _ = currency_alignment_status(canonical)
+    reference_date = _data_reference_date(canonical)
+    mature_installs = filter_mature_cohorts(canonical.installs, reference_date=reference_date, min_days=7)
+    source_installs = mature_installs if not mature_installs.empty else canonical.installs
+    overview_metrics = calculate_media_metrics(source_installs, canonical.events, canonical.cost, level="campaign")
+    overview_metrics["cohort_is_mature"] = not mature_installs.empty
+    overview_metrics["roas_currency_verified"] = currency_status == "aligned"
+    overview = apply_decision_logic(overview_metrics, target_roas=1.0, min_installs=200)
+
+    counts = overview["decision"].value_counts()
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("증액 테스트", int(counts.get("Scale Up", 0)))
+    o2.metric("감액 검토", int(counts.get("Scale Down", 0)))
+    o3.metric("검증 필요", int(sum(counts.get(k, 0) for k in [
+        "Hold (Low Sample)", "Hold (Estimated Cost)", "Hold (Unverified Currency)", "Hold (Immature Cohort)",
+    ])))
+    o4.metric("유지", int(counts.get("Maintain", 0)))
+
+    priority = overview[overview["decision"].isin(["Scale Up", "Scale Down"])].copy()
+    if priority.empty:
+        st.success("현재 기준에서 즉시 예산 조정이 필요한 세그먼트는 없습니다. 아래 상세 판단에서 보류 사유를 확인하세요.")
+    else:
+        priority["세그먼트"] = priority.apply(lambda row: _segment_label(row, "campaign"), axis=1)
+        priority["판단"] = priority["decision"].map(DECISION_LABEL_MAP)
+        priority = priority.assign(_impact=priority["spend"].abs()).sort_values("_impact", ascending=False).head(3)
+        st.markdown("##### 우선 조정 대상")
+        st.dataframe(
+            priority.rename(columns={"d7_roas": "D7 ROAS", "roas_gap_vs_target_pct": "목표 대비", "action": "다음 행동"})[
+                ["판단", "세그먼트", "D7 ROAS", "목표 대비", "다음 행동"]
+            ].style.format({"D7 ROAS": "{:.1%}", "목표 대비": "{:+.1f}%"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+    st.markdown("<a href='#segment-decision' style='text-decoration:none'><button>세그먼트별 판단 확인 ↓</button></a>", unsafe_allow_html=True)
+
+
 # ─────────────────────────────────────────────
 # 예산 배분 계산 함수
 # ─────────────────────────────────────────────
@@ -336,25 +406,26 @@ def _allocate_budget(stats_df, total_budget, exclude_scale_down, decision_df, da
 
 
 # ─────────────────────────────────────────────
-# 탭 구성
+# 업무 영역 구성
 # ─────────────────────────────────────────────
-tab_upload, tab_decision, tab_budget, tab_curve, tab_liveops = st.tabs([
-    "📂 데이터 업로드",
-    "📊 UA 판단",
-    "💰 예산 배분 추천",
-    "📈 코호트 곡선",
-    "🎉 라이브옵스 영향",
+canonical = st.session_state.get("canonical")
+_render_data_status(canonical)
+
+tab_operations, tab_analysis, tab_data = st.tabs([
+    "운영 판단",
+    "분석",
+    "데이터 관리",
 ])
 
 
 # ══════════════════════════════════════════════
-# 탭 1 : 데이터 업로드
+# 데이터 관리 : 업로드 및 품질 확인
 # ══════════════════════════════════════════════
-with tab_upload:
-    st.subheader("데이터 업로드")
+with tab_data:
+    st.subheader("데이터 관리")
 
     if st.session_state.get("_auto_loaded"):
-        st.success("✅ 시나리오 3 기본 더미 데이터가 자동 로딩되었습니다. UA 판단 탭을 바로 확인해보세요!")
+        st.success("시나리오 3 기본 더미 데이터가 자동 로딩되었습니다. `운영 판단`에서 결과를 바로 확인해보세요.")
 
     # 더미 데이터는 AppsFlyer 고정 (MMP 선택 불필요)
     _DUMMY_MMP = "AppsFlyer"
@@ -464,19 +535,18 @@ with tab_upload:
         rd3.download_button("비용 원본 CSV",  data=_to_csv_bytes(raw_bundle.get("cost_raw",      pd.DataFrame())), file_name=f"{raw_mmp.lower()}_cost_raw.csv",      mime="text/csv", use_container_width=True, key="dl_raw_c")
 
 
-# 이후 탭 공통 변수
-canonical = st.session_state.get("canonical")
-
-
 # ══════════════════════════════════════════════
-# 탭 2 : UA 판단
+# 운영 판단 : 오늘의 현황 및 세그먼트 판단
 # ══════════════════════════════════════════════
-with tab_decision:
-    st.subheader("UA 판단")
+with tab_operations:
+    _render_operations_overview(canonical)
+    st.divider()
+    st.markdown("<div id='segment-decision'></div>", unsafe_allow_html=True)
+    st.subheader("세그먼트별 UA 판단")
     _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
-        st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
+        st.warning("먼저 `데이터 관리`에서 데이터를 불러와 주세요.")
     else:
         currency_status, currency_message = currency_alignment_status(canonical)
         if currency_status == "aligned":
@@ -750,14 +820,15 @@ with tab_decision:
 
 
 # ══════════════════════════════════════════════
-# 탭 3 : 예산 배분 추천
+# 운영 판단 : 예산 배분 검토
 # ══════════════════════════════════════════════
-with tab_budget:
-    st.subheader("💰 예산 배분 추천")
+with tab_operations:
+    st.divider()
+    st.subheader("예산 배분 검토")
     _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
-        st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
+        st.warning("먼저 `데이터 관리`에서 데이터를 불러와 주세요.")
     else:
         st.caption("D7 ROAS 비중 기반 배분 | 예상 ROAS = 과거 주간 평균 ± 1σ (표준편차)")
 
@@ -836,14 +907,14 @@ with tab_budget:
 
 
 # ══════════════════════════════════════════════
-# 탭 4 : 코호트 곡선
+# 분석 : 코호트 성장 분석
 # ══════════════════════════════════════════════
-with tab_curve:
-    st.subheader("코호트 곡선")
+with tab_analysis:
+    st.subheader("코호트 성장 분석")
     _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
-        st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
+        st.warning("먼저 `데이터 관리`에서 데이터를 불러와 주세요.")
     else:
         st.caption("D일 누적 LTV = 설치 후 D일 이내 누적 매출 ÷ 설치수")
 
@@ -870,6 +941,11 @@ with tab_curve:
                     medals    = ["🥇", "🥈", "🥉", "4️⃣"]
                     for i, (_, row) in enumerate(d7_rank.head(4).iterrows()):
                         rank_cols[i].metric(f"{medals[i]} {row['segment']}", f"{row['ltv']:.2f}")
+                    leader = d7_rank.iloc[0]
+                    st.info(
+                        f"**운영 해석**  `{leader['segment']}`가 D7 LTV 상위입니다. "
+                        "증액 판단과 함께 볼 때만 예산 확대 테스트 후보로 사용하세요."
+                    )
 
                 st.line_chart(view, x="day", y="ltv", color="segment")
                 st.download_button("📥 코호트 곡선 CSV", data=_to_csv_bytes(view),
@@ -878,14 +954,15 @@ with tab_curve:
 
 
 # ══════════════════════════════════════════════
-# 탭 5 : 라이브옵스 영향
+# 분석 : 라이브옵스 전후 비교
 # ══════════════════════════════════════════════
-with tab_liveops:
+with tab_analysis:
+    st.divider()
     st.subheader("라이브옵스 전후 비교")
     _show_data_period(st.session_state.get("canonical"))
 
     if canonical is None:
-        st.warning("먼저 데이터 업로드 탭에서 데이터를 불러와 주세요.")
+        st.warning("먼저 `데이터 관리`에서 데이터를 불러와 주세요.")
     else:
         st.caption("동일 요일의 과거 코호트와 국가·플랫폼·매체 믹스를 맞춘 D7 LTV 비교입니다. 인과효과를 확정하지 않습니다.")
         st.warning(
@@ -964,6 +1041,10 @@ with tab_liveops:
                 })
                 st.dataframe(display_df.style.format({"D7 LTV 변화": "{:+.4f}", "변화율": "{:+.1%}"}), use_container_width=True)
                 st.caption("국가·플랫폼·매체 등 관측 가능한 믹스만 보정합니다. 통제군 또는 무작위 홀드아웃이 없으면 순수한 LiveOps 인과효과는 산출하지 않습니다.")
+                if top_seg["uplift"] > 0:
+                    st.info(f"**운영 해석**  `{top_seg['비교 세그먼트']}`의 상승 신호는 다음 이벤트에서 검증용 예산 테스트 후보입니다. 통제군 없이 즉시 확대하지는 마세요.")
+                else:
+                    st.info("**운영 해석**  뚜렷한 상승 신호가 없습니다. 다음 이벤트에서도 같은 기준으로 비교해 추세를 확인하세요.")
                 st.download_button("📥 보정 비교 결과 CSV", data=_to_csv_bytes(filtered),
                                    file_name="liveops_adjusted_comparison.csv", mime="text/csv",
                                    use_container_width=True, key="dl_liveops")

@@ -221,24 +221,18 @@ project_root/
 
 ## 9. UI Requirements (Streamlit)
 
-구성 탭:
+업무 영역:
 
-- Upload Data
-  - MMP 선택
-  - Install / Event / Cost Raw 업로드
-- UA Decision
-  - Level 선택(media/campaign/adset/creative)
-  - KPI 테이블 + decision reason + efficiency note
-  - ROAS gap / install gap 컬럼 제공
-  - 통화 정합성·D7 성숙도·비용 신뢰도 가드레일 표시
-  - 단계적 증액 테스트 / 감액 / 보류 표시
-- Cohort Curve
-  - Level 선택 기반 D1~D30 누적 LTV 시각화
-  - 세그먼트별 비교
-- LiveOps 전후 비교
-  - 이벤트 기간 입력
-  - 동일 요일·층화·가중 보정 비교
-  - 통제군 부재 시 해석 한계 표시
+- 운영 판단
+  - 오늘의 UA 운영 현황: 증액·감액·검증 필요 요약과 우선 조정 대상
+  - 세그먼트별 판단: D7 ROAS, 목표 대비, 데이터 신뢰도, 다음 행동
+  - 예산 배분 검토: ROAS 변동성을 고려한 매체별 배분안
+- 분석
+  - 코호트 성장 분석: Level 선택 기반 D1~D30 누적 LTV와 운영 해석
+  - 라이브옵스 전후 비교: 동일 요일·층화·가중 보정 비교와 인과 해석 한계
+- 데이터 관리
+  - MMP 선택 및 Install / Event / Cost Raw 업로드
+  - 통화 정합성·D7 성숙도·비용 신뢰도 상태 확인
 
 ---
 
@@ -264,7 +258,7 @@ project_root/
 3. **코어 계산 엔진 정비**: Cohort LTV / ROAS / Payback 계산 모듈화
 4. **의사결정 엔진 분리**: rule 기반 판단 로직 모듈 단독 관리
 5. **LiveOps 분석 모듈 구축**: 이벤트 전후 코호트 비교 자동화
-6. **UI 재구성**: Upload → Decision → Curve → LiveOps 탭 구조 적용
+6. **UI 재구성**: 운영 판단 → 분석 → 데이터 관리 업무 구조 적용
 7. **Dummy Data 자동화**: 시나리오 기반 샘플 데이터 생성기 운영
 8. **검증 & 확장 준비**: 테스트, 성능 점검, BigQuery 연결 포인트 사전 설계
 
